@@ -16,6 +16,11 @@ const STAGE_ICONS = {
   generate: <ThunderboltOutlined />,
 };
 
+function formatRerankScore(score) {
+  if (score === null || score === undefined || Number.isNaN(Number(score))) return null;
+  return Number(score).toFixed(3);
+}
+
 export default function ChatBubble({ message }) {
   const [expanded, setExpanded] = useState(false);
   const [selectedSource, setSelectedSource] = useState(null);
@@ -109,6 +114,11 @@ export default function ChatBubble({ message }) {
                     onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.02)'; }}
                   >
                     <Typography.Text strong>{s.filename || s.source}</Typography.Text>
+                    {formatRerankScore(s.score) !== null && (
+                      <Tag color="blue" style={{ marginLeft: 6, marginRight: 0 }}>
+                        rerank {formatRerankScore(s.score)}
+                      </Tag>
+                    )}
                     {s.page && <Typography.Text type="secondary" style={{ marginLeft: 4 }}>第{s.page}页</Typography.Text>}
                     <Typography.Paragraph
                       style={{ margin: 0, fontSize: 12 }}

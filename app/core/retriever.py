@@ -156,11 +156,12 @@ class Retriever:
         except Exception:
             return 0
 
-    def list_document_chunks(self, kb_id: str, source: str) -> list[dict[str, Any]]:
+    def list_document_chunks(self, kb_id: str, source: str | None = None, doc_id: str | None = None) -> list[dict[str, Any]]:
         """Return all stored chunks for one source document."""
         try:
             vs = self._get_vectorstore(kb_id)
-            data = vs.get(where={"source": source})
+            where = {"doc_id": doc_id} if doc_id else {"source": source}
+            data = vs.get(where=where)
         except Exception as exc:
             logger.warning("获取文档 chunks 失败: %s", exc)
             return []
@@ -208,22 +209,29 @@ class Retriever:
             self._rebuild_bm25(kb_id)
         logger.info("知识库 %s 已索引 %d 个文本块", kb_id, len(chunks))
 
-    def remove_document(self, kb_id: str, source: str | None = None):
+    def remove_document(
+        self,
+        kb_id: str,
+        source: str | None = None,
+        doc_id: str | None = None,
+        task_id: str | None = None,
+    ):
         """从指定知识库中删除文档的 chunks"""
         try:
             vs = self._get_vectorstore(kb_id)
         except Exception as exc:
             logger.warning("打开知识库 %s 的 Chroma collection 失败: %s", kb_id, exc)
             return
-        if source:
-            results = vs.get(where={"source": source})
+        where = {"task_id": task_id} if task_id else {"doc_id": doc_id} if doc_id else {"source": source} if source else None
+        if where:
+            results = vs.get(where=where)
             ids_to_delete = results.get("ids", [])
             if ids_to_delete:
                 vs.delete(ids=ids_to_delete)
-                logger.info("知识库 %s 已删除 %s 的 %d 个 chunks", kb_id, source, len(ids_to_delete))
+                logger.info("知识库 %s 已删除 %s 的 %d 个 chunks", kb_id, task_id or doc_id or source, len(ids_to_delete))
 
         # 同时清理 BM25 索引 — 从 ChromaDB 重建以排除已删除文档
-        if source and kb_id in self._bm25_indices:
+        if where and kb_id in self._bm25_indices:
             with self._lock:
                 remaining_entries = self._entries_from_chroma(vs.get())
                 if remaining_entries:

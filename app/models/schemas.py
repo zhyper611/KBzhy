@@ -16,9 +16,13 @@ from pydantic import BaseModel, Field
 
 class DocStatus(str, Enum):
     UPLOADED = "uploaded"
+    QUEUED = "queued"
     PARSING = "parsing"
+    CHUNKING = "chunking"
+    INDEXING = "indexing"
     READY = "ready"
     FAILED = "failed"
+    DELETING = "deleting"
 
 
 class RerankMethod(str, Enum):
@@ -131,6 +135,8 @@ class DocumentInfo(BaseModel):
     kb_id: str
     status: DocStatus
     chunk_count: int = 0
+    task_id: str | None = None
+    error_message: str | None = None
     created_at: str
     updated_at: str
 
@@ -157,6 +163,8 @@ class DocumentUpdateResponse(BaseModel):
     kb_id: str
     status: DocStatus
     chunk_count: int
+    task_id: str | None = None
+    error_message: str | None = None
     message: str
 
 

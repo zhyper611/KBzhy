@@ -89,6 +89,15 @@ def test_chat_markdown_supports_gfm_and_soft_breaks():
     assert "remarkPlugins={[remarkGfm, remarkBreaks]}" in source
 
 
+def test_chat_sources_show_rerank_score_badge():
+    source = Path("frontend/src/components/ChatBubble.jsx").read_text(encoding="utf-8")
+
+    assert "function formatRerankScore(score)" in source
+    assert "Number(score).toFixed(3)" in source
+    assert '<Tag color="blue"' in source
+    assert "rerank {formatRerankScore(s.score)}" in source
+
+
 def test_document_table_can_open_document_chunks_drawer():
     table = Path("frontend/src/components/DocumentTable.jsx").read_text(encoding="utf-8")
     api = Path("frontend/src/api/documents.js").read_text(encoding="utf-8")

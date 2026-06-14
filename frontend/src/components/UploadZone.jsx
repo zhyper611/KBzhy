@@ -12,10 +12,10 @@ export default function UploadZone({ kbId, onUploaded }) {
   const handleUpload = async (file) => {
     setUploading(true);
     setProgressFile(file.name);
-    antMsg.loading({ content: `正在解析 ${file.name}...`, key: 'upload', duration: 0 });
+    antMsg.loading({ content: `${file.name} 正在上传...`, key: 'upload', duration: 0 });
     try {
       const result = await uploadDocument(kbId, file);
-      antMsg.success({ content: `${file.name} 上传成功`, key: 'upload' });
+      antMsg.success({ content: `${file.name} 已上传，后台正在索引`, key: 'upload' });
       onUploaded?.();
       return result;
     } catch (err) {
@@ -42,7 +42,7 @@ export default function UploadZone({ kbId, onUploaded }) {
         {uploading ? (
           <>
             <Spin size="large" />
-            <p className="ant-upload-text" style={{ marginTop: 12 }}>正在解析中...</p>
+            <p className="ant-upload-text" style={{ marginTop: 12 }}>正在上传...</p>
             <p className="ant-upload-hint">{progressFile}</p>
           </>
         ) : (

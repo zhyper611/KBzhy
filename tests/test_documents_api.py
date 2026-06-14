@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import glob
-import os
-import tempfile
 
 import pytest
 from fastapi import HTTPException
@@ -20,9 +17,31 @@ class FakeUploadFile:
         return self._content
 
 
+class FakeStore:
+    def __init__(self):
+        self.kbs = {}
+        self.documents = {}
+        self.tasks = {}
+
+    def knowledge_base_exists(self, kb_id):
+        return kb_id in self.kbs
+
+    def create_document(self, data):
+        self.documents[data["id"]] = dict(data)
+
+    def create_task(self, data):
+        self.tasks[data["task_id"]] = dict(data)
+
+    def get_document(self, kb_id, doc_id):
+        doc = self.documents.get(doc_id)
+        if doc and doc["kb_id"] == kb_id:
+            return dict(doc)
+        return None
+
+
 def test_upload_rejects_unknown_knowledge_base(monkeypatch):
-    monkeypatch.setattr(documents, "_doc_registry", {})
-    monkeypatch.setattr(documents, "_kb_meta", {})
+    store = FakeStore()
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
     monkeypatch.setattr(documents, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("engine should not be used")))
 
     with pytest.raises(HTTPException) as exc:
@@ -31,30 +50,35 @@ def test_upload_rejects_unknown_knowledge_base(monkeypatch):
     assert exc.value.status_code == 404
 
 
-def test_upload_removes_temp_file_when_indexing_fails(monkeypatch):
-    class FailingEngine:
-        def index_document(self, tmp_path, kb_id, display_name=None):
-            assert os.path.exists(tmp_path)
-            raise RuntimeError("index failed")
+def test_upload_rejects_empty_file(monkeypatch):
+    store = FakeStore()
+    store.kbs["kb1"] = {"kb_id": "kb1"}
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
 
-    monkeypatch.setattr(documents, "_doc_registry", {"kb1": {}})
-    monkeypatch.setattr(documents, "_kb_meta", {"kb1": {"name": "KB"}})
-    monkeypatch.setattr(documents, "get_engine", lambda: FailingEngine())
-    monkeypatch.setattr(documents, "_save_registry", lambda: None)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(documents.upload_document("kb1", FakeUploadFile("empty.txt", b"")))
 
-    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "*.txt")))
-    with pytest.raises(HTTPException):
-        asyncio.run(documents.upload_document("kb1", FakeUploadFile("leak-check.txt", b"hello")))
-    after = set(glob.glob(os.path.join(tempfile.gettempdir(), "*.txt")))
-
-    assert after == before
+    assert exc.value.status_code == 400
 
 
-def test_get_document_chunks_returns_chunks_for_existing_document(monkeypatch):
+def test_get_document_chunks_returns_chunks_for_ready_document(monkeypatch):
+    store = FakeStore()
+    store.documents["doc1"] = {
+        "id": "doc1",
+        "filename": "guide.pdf",
+        "file_type": ".pdf",
+        "kb_id": "kb1",
+        "status": "ready",
+        "chunk_count": 2,
+        "created_at": "2026-06-11T10:00:00",
+        "updated_at": "2026-06-11T10:00:00",
+    }
+
     class ChunkEngine:
-        def list_document_chunks(self, kb_id, source):
+        def list_document_chunks(self, kb_id, source=None, doc_id=None):
             assert kb_id == "kb1"
             assert source == "guide.pdf"
+            assert doc_id == "doc1"
             return [
                 {
                     "chunk_index": 2,
@@ -68,22 +92,7 @@ def test_get_document_chunks_returns_chunks_for_existing_document(monkeypatch):
                 },
             ]
 
-    monkeypatch.setattr(
-        documents,
-        "_doc_registry",
-        {
-            "kb1": {
-                "doc1": {
-                    "filename": "guide.pdf",
-                    "kb_id": "kb1",
-                    "status": "ready",
-                    "chunk_count": 2,
-                    "created_at": "2026-06-11T10:00:00",
-                    "updated_at": "2026-06-11T10:00:00",
-                }
-            }
-        },
-    )
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
     monkeypatch.setattr(documents, "get_engine", lambda: ChunkEngine())
 
     response = documents.get_document_chunks("kb1", "doc1")
@@ -96,8 +105,30 @@ def test_get_document_chunks_returns_chunks_for_existing_document(monkeypatch):
     assert response.chunks[0].content == "first chunk"
 
 
+def test_get_document_chunks_returns_empty_for_unready_document(monkeypatch):
+    store = FakeStore()
+    store.documents["doc1"] = {
+        "id": "doc1",
+        "filename": "guide.pdf",
+        "file_type": ".pdf",
+        "kb_id": "kb1",
+        "status": "indexing",
+        "chunk_count": 0,
+        "created_at": "2026-06-11T10:00:00",
+        "updated_at": "2026-06-11T10:00:00",
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("engine should not be used")))
+
+    response = documents.get_document_chunks("kb1", "doc1")
+
+    assert response.total == 0
+    assert response.chunks == []
+
+
 def test_get_document_chunks_rejects_unknown_document(monkeypatch):
-    monkeypatch.setattr(documents, "_doc_registry", {"kb1": {}})
+    store = FakeStore()
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
     monkeypatch.setattr(documents, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("engine should not be used")))
 
     with pytest.raises(HTTPException) as exc:

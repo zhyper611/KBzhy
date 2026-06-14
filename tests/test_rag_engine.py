@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import httpx
+import pytest
+from fastapi import HTTPException
 
+from KBzhy.app.api import chat
 from KBzhy.app.core.rag_engine import KNOWLEDGE_QA_REFUSAL, KNOWLEDGE_QA_SYSTEM_PROMPT, RAGEngine
 
 
@@ -67,6 +70,36 @@ def test_build_messages_uses_strict_knowledge_qa_prompt():
     assert "参考资料" in messages[0]["content"]
 
 
+def test_index_docs_adds_doc_and_task_metadata_to_chunks():
+    class Splitter:
+        def split(self, content, doc_type, metadata):
+            from KBzhy.app.core.splitter import Chunk
+
+            return [Chunk("chunk", metadata=dict(metadata))]
+
+    class Retriever:
+        def __init__(self):
+            self.chunks = []
+
+        def add_documents(self, chunks, kb_id):
+            self.chunks.extend(chunks)
+
+    class ParsedDoc:
+        content = "content"
+        metadata = {"file_type": "text"}
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.splitter = Splitter()
+    engine.retriever = Retriever()
+
+    count = engine._index_docs([ParsedDoc()], "kb1", doc_id="doc1", task_id="task1")
+
+    assert count == 1
+    assert engine.retriever.chunks[0].metadata["doc_id"] == "doc1"
+    assert engine.retriever.chunks[0].metadata["task_id"] == "task1"
+    assert engine.retriever.chunks[0].metadata["chunk_index"] == 1
+
+
 def test_prepare_query_skips_rewrite_for_clear_question_by_default():
     memory = FakeMemory(context=[
         {"role": "user", "content": "上一轮问题"},
@@ -110,3 +143,16 @@ def test_response_preview_handles_unread_streaming_response():
     preview = RAGEngine._response_preview(UnreadResponse())
 
     assert preview == "<streaming response body not read>"
+
+
+def test_chat_api_rejects_unknown_kb(monkeypatch):
+    class Store:
+        def knowledge_base_exists(self, kb_id):
+            return False
+
+    monkeypatch.setattr(chat, "get_metadata_store", lambda: Store())
+
+    with pytest.raises(HTTPException) as exc:
+        chat._ensure_kb_exists("missing")
+
+    assert exc.value.status_code == 404

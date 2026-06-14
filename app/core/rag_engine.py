@@ -179,33 +179,54 @@ class RAGEngine:
     def get_kb_doc_count(self, kb_id: str) -> int:
         return self.retriever.get_kb_doc_count(kb_id)
 
-    def list_document_chunks(self, kb_id: str, source: str) -> list[dict[str, Any]]:
-        return self.retriever.list_document_chunks(kb_id, source)
+    def list_document_chunks(self, kb_id: str, source: str | None = None, doc_id: str | None = None) -> list[dict[str, Any]]:
+        return self.retriever.list_document_chunks(kb_id, source=source, doc_id=doc_id)
 
     # ── 文档索引 ────────────────────────────────
 
-    def index_document(self, file_path: str, kb_id: str, display_name: str | None = None) -> int:
+    def index_document(
+        self,
+        file_path: str,
+        kb_id: str,
+        display_name: str | None = None,
+        doc_id: str | None = None,
+        task_id: str | None = None,
+    ) -> int:
         docs = self.parser.parse(file_path)
         if display_name:
             for doc in docs:
                 doc.metadata["source"] = display_name
-        return self._index_docs(docs, kb_id)
+        if doc_id:
+            for doc in docs:
+                doc.metadata["doc_id"] = doc_id
+        if task_id:
+            for doc in docs:
+                doc.metadata["task_id"] = task_id
+        return self._index_docs(docs, kb_id, doc_id=doc_id, task_id=task_id)
 
     def index_bytes(self, content: bytes, filename: str, kb_id: str) -> int:
         docs = self.parser.parse_bytes(content, filename)
         return self._index_docs(docs, kb_id)
 
-    def _index_docs(self, docs, kb_id: str) -> int:
+    def _index_docs(self, docs, kb_id: str, doc_id: str | None = None, task_id: str | None = None) -> int:
         total = 0
+        chunk_index = 1
         for doc in docs:
             file_type = doc.metadata.get("file_type", "text")
             chunks = self.splitter.split(doc.content, doc_type=file_type, metadata=doc.metadata)
+            for chunk in chunks:
+                if doc_id:
+                    chunk.metadata["doc_id"] = doc_id
+                if task_id:
+                    chunk.metadata["task_id"] = task_id
+                chunk.metadata["chunk_index"] = chunk_index
+                chunk_index += 1
             self.retriever.add_documents(chunks, kb_id)
             total += len(chunks)
         return total
 
-    def remove_document(self, filename: str, kb_id: str):
-        self.retriever.remove_document(kb_id, source=filename)
+    def remove_document(self, filename: str, kb_id: str, doc_id: str | None = None, task_id: str | None = None):
+        self.retriever.remove_document(kb_id, source=filename, doc_id=doc_id, task_id=task_id)
 
     # ── 对话（支持 stuff / map_reduce / refine）───
 

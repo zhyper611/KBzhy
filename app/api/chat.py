@@ -22,7 +22,7 @@ from KBzhy.app.models.schemas import (
 from KBzhy.config import REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD
 from KBzhy.app.core.rag_engine import RAGEngine
 from KBzhy.app.core.engine import get_rag_engine
-from KBzhy.app.api.documents import _kb_meta
+from KBzhy.app.core.metadata_store import get_metadata_store
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,17 @@ def get_engine() -> RAGEngine:
     return get_rag_engine()
 
 
+def _ensure_kb_exists(kb_id: str | None):
+    if not kb_id:
+        return
+    try:
+        exists = get_metadata_store().knowledge_base_exists(kb_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="MySQL 元数据存储不可用，请检查数据库配置和连接") from exc
+    if not exists:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+
 def _sse_data(data: str) -> str:
     lines = data.split("\n")
     return "".join(f"data: {line}\n" for line in lines) + "\n"
@@ -154,7 +165,13 @@ def list_sessions(kb_id: str | None = Query(default=None)):
         except Exception:
             pass
         session_kb_id = meta.get("kb_id")
-        kb_name = _kb_meta.get(session_kb_id, {}).get("name", "") if session_kb_id else ""
+        kb_name = ""
+        if session_kb_id:
+            try:
+                kb = get_metadata_store().get_kb(session_kb_id)
+                kb_name = (kb or {}).get("name", "")
+            except Exception:
+                kb_name = ""
         result.append(SessionResponse(
             session_id=sid,
             title=meta.get("title", ""),
@@ -190,6 +207,7 @@ def get_session_messages(session_id: str):
 
 @router.post("/chat", response_model=ChatResponse)
 def single_chat(body: ChatRequest):
+    _ensure_kb_exists(body.kb_id)
     engine = get_engine()
     try:
         result = engine.chat(
@@ -224,6 +242,7 @@ def single_chat(body: ChatRequest):
 
 @router.post("/chat/stream")
 def single_chat_stream(body: ChatRequest):
+    _ensure_kb_exists(body.kb_id)
     engine = get_engine()
 
     def generate():
@@ -260,6 +279,7 @@ def single_chat_stream(body: ChatRequest):
 
 @router.post("/chat/{session_id}", response_model=ChatResponse)
 def multi_chat(session_id: str, body: ChatRequest):
+    _ensure_kb_exists(body.kb_id)
     _auto_title(session_id, body.question)
     engine = get_engine()
     try:
@@ -296,6 +316,7 @@ def multi_chat(session_id: str, body: ChatRequest):
 
 @router.post("/chat/{session_id}/stream")
 def multi_chat_stream(session_id: str, body: ChatRequest):
+    _ensure_kb_exists(body.kb_id)
     _auto_title(session_id, body.question)
     engine = get_engine()
 

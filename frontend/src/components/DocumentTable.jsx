@@ -5,13 +5,17 @@ import { listDocuments, deleteDocument, getDocumentChunks } from '../api/documen
 import dayjs from 'dayjs';
 
 const STATUS_MAP = {
-  pending: { color: 'processing', text: '处理中' },
-  ready: { color: 'success', text: '就绪' },
-  error: { color: 'error', text: '失败' },
+  queued: { color: 'default', text: '排队中' },
   parsing: { color: 'processing', text: '解析中' },
-  uploaded: { color: 'default', text: '已上传' },
+  chunking: { color: 'processing', text: '分块中' },
+  indexing: { color: 'processing', text: '索引中' },
+  ready: { color: 'success', text: '就绪' },
   failed: { color: 'error', text: '失败' },
+  deleting: { color: 'warning', text: '删除中' },
+  uploaded: { color: 'default', text: '已上传' },
 };
+
+const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'chunking', 'indexing', 'deleting']);
 
 export default function DocumentTable({ kbId, refreshKey }) {
   const [docs, setDocs] = useState([]);
@@ -36,6 +40,12 @@ export default function DocumentTable({ kbId, refreshKey }) {
 
   useEffect(() => { refresh(); }, [refresh, refreshKey]);
 
+  useEffect(() => {
+    if (!docs.some((doc) => ACTIVE_STATUSES.has(doc.status))) return undefined;
+    const timer = window.setInterval(refresh, 2000);
+    return () => window.clearInterval(timer);
+  }, [docs, refresh]);
+
   const openChunks = async (record) => {
     setSelectedDoc(record);
     setDrawerOpen(true);
@@ -44,6 +54,9 @@ export default function DocumentTable({ kbId, refreshKey }) {
     try {
       const data = await getDocumentChunks(kbId, record.id);
       setChunks(data.chunks || []);
+      if (record.status !== 'ready') {
+        message.info('文档尚未索引完成，暂无分块内容');
+      }
     } catch (err) {
       message.error(err.message);
       setChunks([]);
@@ -61,7 +74,9 @@ export default function DocumentTable({ kbId, refreshKey }) {
         setChunks([]);
       }
       refresh();
-    } catch { /* ignore */ }
+    } catch (err) {
+      message.error(err.message || '删除失败');
+    }
   };
 
   const columns = [
@@ -77,24 +92,37 @@ export default function DocumentTable({ kbId, refreshKey }) {
       ),
     },
     {
-      title: '状态', dataIndex: 'status', key: 'status', width: 100,
-      render: (s) => {
-        const cfg = STATUS_MAP[s] || { color: 'default', text: s };
-        return <Tag color={cfg.color}>{cfg.text}</Tag>;
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 110,
+      render: (status, record) => {
+        const cfg = STATUS_MAP[status] || { color: 'default', text: status };
+        return (
+          <Tag color={cfg.color} title={record.error_message || ''}>
+            {cfg.text}
+          </Tag>
+        );
       },
     },
     { title: '分块数', dataIndex: 'chunk_count', key: 'chunk_count', width: 80, align: 'center' },
     {
-      title: '上传时间', dataIndex: 'created_at', key: 'created_at', width: 160,
-      render: (v) => dayjs(v).format('YYYY-MM-DD HH:mm'),
+      title: '上传时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 160,
+      render: (value) => dayjs(value).format('YYYY-MM-DD HH:mm'),
     },
     {
-      title: '操作', key: 'action', width: 120, align: 'center',
+      title: '操作',
+      key: 'action',
+      width: 120,
+      align: 'center',
       render: (_, record) => (
         <Space size={4} onClick={(e) => e.stopPropagation()}>
           <Button type="text" icon={<EyeOutlined />} onClick={() => openChunks(record)} />
           <Popconfirm title="确定删除此文档？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="text" danger icon={<DeleteOutlined />} />
+            <Button type="text" danger icon={<DeleteOutlined />} disabled={record.status === 'deleting'} />
           </Popconfirm>
         </Space>
       ),
@@ -114,7 +142,7 @@ export default function DocumentTable({ kbId, refreshKey }) {
         loading={loading}
         size="middle"
         locale={{ emptyText: '暂无文档，请上传' }}
-        pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (t) => `共 ${t} 个文档` }}
+        pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (total) => `共 ${total} 个文档` }}
         onRow={(record) => ({
           onClick: () => openChunks(record),
           style: { cursor: 'pointer' },

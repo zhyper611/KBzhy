@@ -35,6 +35,7 @@ CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "c
 # ====== 路径 ======
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 FILE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations")
+UPLOAD_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploads")
 
 # ====== 文档切分参数 ======
 CHUNK_SIZE = 500
