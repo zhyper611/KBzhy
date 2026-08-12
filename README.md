@@ -1,6 +1,16 @@
 # KBzhy RAG Studio Lab
 
-> 基于 FastAPI、React、ChromaDB 与阿里云百炼兼容 OpenAI API 的企业级 RAG 知识库问答系统。
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white)](https://vitejs.dev/)
+[![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector_DB-FF6B35)](https://www.trychroma.com/)
+[![MySQL](https://img.shields.io/badge/MySQL-Persistence-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
+[![Redis](https://img.shields.io/badge/Redis-Hot_Cache-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![RAG](https://img.shields.io/badge/RAG-Hybrid_Retrieval-1677FF)](#rag-流程)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> 面向 RAG 实训、原型验证与企业知识库场景的全栈智能问答系统：**FastAPI API + React 控制台 + ChromaDB 混合检索 + MySQL 持久化 + Redis 会话热缓存**。
 
 KBzhy 是一个面向实训、原型验证和企业知识库场景的全栈 RAG 应用。项目提供完整的知识库管理、文档上传解析、智能分块、混合检索、重排序、多轮会话、流式问答和前端交互界面，适合用于学习 RAG 系统工程化落地，也可以作为内部知识库问答产品的基础骨架。
 
@@ -20,32 +30,17 @@ KBzhy 是一个面向实训、原型验证和企业知识库场景的全栈 RAG 
 
 ## 技术栈
 
-### 后端
+| 分层 | 技术 | 职责 |
+| --- | --- | --- |
+| 前端 | React 18、Vite 5、Ant Design 5 | 知识库管理、文档上传、流式问答与检索参数配置 |
+| API | Python 3.10+、FastAPI、Uvicorn、Pydantic | REST/SSE 接口、请求校验与 RAG 流程编排 |
+| 模型接入 | OpenAI Python SDK、httpx | 调用兼容 OpenAI 协议的 LLM、Embedding 与 Rerank 服务 |
+| 检索 | LangChain Chroma、ChromaDB、rank-bm25、jieba | 向量检索、关键词检索、MMR 与混合召回 |
+| 文档解析 | PyMuPDF、python-docx、openpyxl、python-pptx | PDF、Word、Excel、PPT 等多格式内容解析 |
+| 持久化 | MySQL | 存储知识库、文档、索引任务元数据及完整对话记录 |
+| 热缓存 | Redis（可选） | 缓存最近会话上下文和会话元数据；不可用时回退本地文件 |
 
-- Python 3.10+
-- FastAPI
-- Uvicorn
-- Pydantic
-- OpenAI Python SDK
-- httpx
-- LangChain Chroma
-- ChromaDB
-- rank-bm25
-- jieba
-- PyMuPDF / python-docx / openpyxl / python-pptx
-- Redis，可选，用于会话热记忆与会话元数据缓存
-- MySQL，可选，当前配置预留
-
-### 前端
-
-- React 18
-- Vite 5
-- Ant Design 5
-- React Router
-- React Markdown
-- remark-gfm / remark-breaks
-
-### 模型与平台
+### 默认模型与平台
 
 默认面向阿里云百炼 DashScope 兼容 OpenAI API：
 
@@ -72,6 +67,9 @@ flowchart LR
     Chat --> Engine["RAGEngine<br/>流程编排"]
     Engine --> Retriever
     Engine --> Memory["MemoryManager<br/>会话记忆"]
+    KB --> MySQL["MySQL<br/>元数据与任务"]
+    Memory --> Redis["Redis<br/>会话热缓存"]
+    Memory --> MySQL
 
     Retriever --> Chroma["ChromaDB<br/>向量库"]
     Retriever --> BM25["BM25<br/>关键词索引"]
@@ -230,7 +228,7 @@ Vite 已配置 `/api` 代理到 `http://127.0.0.1:8000`，开发时前端无需�
 | `REDIS_DB` | `0` | Redis 数据库编号 |
 | `REDIS_PASSWORD` | 空 | Redis 密码 |
 | `REDIS_TTL` | `1800` | Redis 会话过期时间 |
-| `MYSQL_HOST` | `localhost` | MySQL 主机，当前为预留配置 |
+| `MYSQL_HOST` | `localhost` | MySQL 主机；知识库与文档管理依赖该数据库 |
 | `MYSQL_PORT` | `3306` | MySQL 端口 |
 | `MYSQL_USER` | `root` | MySQL 用户 |
 | `MYSQL_PASSWORD` | 空 | MySQL 密码 |
@@ -407,14 +405,16 @@ uvicorn KBzhy.main:app --host 0.0.0.0 --port 8000
 
 ## 数据与持久化
 
-默认本地持久化路径：
+项目按数据用途采用分层存储：
 
-- `chroma_db/`：ChromaDB 向量数据库。
-- `data/doc_registry.json`：文档注册表。
-- `data/kb_meta.json`：知识库元数据。
-- `data/conversations/`：会话相关本地数据目录。
+| 存储 | 数据内容 | 是否必需 | 持久化说明 |
+| --- | --- | --- | --- |
+| ChromaDB | 文档分块、向量及分块元数据 | 是 | 默认写入项目根目录下的 `chroma_db/` |
+| MySQL | 知识库、文档、索引任务元数据及完整对话记录 | 是 | 使用 `knowledge_bases`、`documents`、`document_index_tasks`、`conversation_logs` 表；知识库和文档接口在连接不可用时返回 `503` |
+| Redis | 最近 N 轮会话上下文及会话元数据 | 否 | 热缓存数据按 TTL 过期；不可用时会话数据回退到本地文件 |
+| 本地文件 | Redis 或 MySQL 不可用时的会话上下文与对话日志 | 回退存储 | 默认写入 `data/conversations/` |
 
-这些运行时数据默认不建议提交到 Git。`.gitignore` 已排除相关目录和文件。
+`data/doc_registry.json` 和 `data/kb_meta.json` 仅用于兼容并迁移旧版本元数据，不再是当前主存储。ChromaDB 与本地回退文件均属于运行时数据，默认不建议提交到 Git；MySQL 和 Redis 的生产环境数据应通过独立实例及备份策略管理。
 
 ## 安全注意事项
 
