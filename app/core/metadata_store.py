@@ -18,6 +18,19 @@ from KBzhy.config import (
 logger = logging.getLogger(__name__)
 
 
+_COLUMN_MIGRATIONS = {
+    ("knowledge_bases", "active_collection_name"): "VARCHAR(255) NULL",
+    ("documents", "content_hash"): "VARCHAR(64) NULL",
+    ("documents", "current_version"): "INT NOT NULL DEFAULT 1",
+    ("documents", "parser_version"): "VARCHAR(64) NULL",
+    ("documents", "active_index_version"): "INT NOT NULL DEFAULT 1",
+    ("documents", "parsed_artifact_path"): "TEXT NULL",
+    ("document_index_tasks", "document_version"): "INT NOT NULL DEFAULT 1",
+    ("document_index_tasks", "index_version"): "INT NOT NULL DEFAULT 1",
+    ("document_index_tasks", "attempt_count"): "INT NOT NULL DEFAULT 0",
+}
+
+
 class MetadataStoreUnavailable(RuntimeError):
     pass
 
@@ -128,12 +141,80 @@ class MySQLMetadataStore:
                     REFERENCES documents(doc_id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
+            """
+            CREATE TABLE IF NOT EXISTS document_versions (
+                version_id VARCHAR(128) PRIMARY KEY,
+                doc_id VARCHAR(128) NOT NULL,
+                version INT NOT NULL,
+                content_hash VARCHAR(64) NULL,
+                parser_version VARCHAR(64) NULL,
+                parsed_artifact_path TEXT NULL,
+                status VARCHAR(32) NOT NULL,
+                created_at DATETIME(3) NOT NULL,
+                UNIQUE KEY uq_document_versions_doc_version (doc_id, version),
+                INDEX idx_document_versions_doc_status (doc_id, status),
+                CONSTRAINT fk_document_versions_doc FOREIGN KEY (doc_id)
+                    REFERENCES documents(doc_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                chunk_id VARCHAR(64) PRIMARY KEY,
+                task_id VARCHAR(128) NOT NULL,
+                doc_id VARCHAR(128) NOT NULL,
+                document_version INT NOT NULL,
+                parent_chunk_id VARCHAR(64) NULL,
+                chunk_type VARCHAR(16) NOT NULL,
+                content LONGTEXT NOT NULL,
+                retrieval_text LONGTEXT NOT NULL,
+                content_hash VARCHAR(64) NOT NULL,
+                section_path_json LONGTEXT NOT NULL,
+                page_start INT NULL,
+                page_end INT NULL,
+                position INT NOT NULL,
+                token_count INT NOT NULL,
+                index_version INT NOT NULL DEFAULT 1,
+                status VARCHAR(32) NOT NULL,
+                metadata_json LONGTEXT NOT NULL,
+                created_at DATETIME(3) NOT NULL,
+                updated_at DATETIME(3) NOT NULL,
+                INDEX idx_chunks_doc_version_position (doc_id, document_version, position),
+                INDEX idx_chunks_parent (parent_chunk_id),
+                INDEX idx_chunks_status_index (status, index_version),
+                INDEX idx_chunks_task (task_id),
+                CONSTRAINT fk_document_chunks_doc FOREIGN KEY (doc_id)
+                    REFERENCES documents(doc_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
         ]
         for sql in statements:
             cur = self._conn.cursor()
             cur.execute(sql)
             cur.close()
+        for (table, column), ddl in _COLUMN_MIGRATIONS.items():
+            self._ensure_column(table, column, ddl)
         self._conn.commit()
+
+    def _ensure_column(self, table: str, column: str, ddl: str):
+        if _COLUMN_MIGRATIONS.get((table, column)) != ddl:
+            raise ValueError("column migration is not allowed")
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT 1 AS present
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        present = cur.fetchone()
+        cur.close()
+        if present:
+            return
+        cur = self._conn.cursor()
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        cur.close()
 
     @staticmethod
     def _dt(value: Any) -> str:
