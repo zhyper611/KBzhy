@@ -237,7 +237,9 @@ class MySQLMetadataStore:
                 )
             else:
                 raise RuntimeError("unsupported document_chunks primary key shape")
-        elif primary_columns != ("row_id",):
+            if not self._document_chunks_primary_matches():
+                raise RuntimeError("document_chunks primary key migration did not produce auto-increment row_id")
+        elif not self._document_chunks_primary_matches():
             raise RuntimeError("row_id exists but is not the document_chunks primary key")
 
         chunk_id = self._get_column("document_chunks", "chunk_id")
@@ -249,7 +251,8 @@ class MySQLMetadataStore:
 
         for name, (kind, columns) in _CHUNK_INDEXES.items():
             existing = self._get_index_columns("document_chunks", name)
-            if existing == columns:
+            expected_unique = kind == "UNIQUE KEY"
+            if existing == columns and self._index_is_unique("document_chunks", name) == expected_unique:
                 continue
             if existing:
                 legacy_global_index = (
@@ -267,6 +270,11 @@ class MySQLMetadataStore:
                 f"ALTER TABLE document_chunks ADD {kind} {name} ({column_sql})",
                 {1061},
             )
+            if (
+                self._get_index_columns("document_chunks", name) != columns
+                or self._index_is_unique("document_chunks", name) != expected_unique
+            ):
+                raise RuntimeError(f"document_chunks index shape did not match after migration: {name}")
 
         for name, (columns, referenced_table, referenced_columns) in _CHUNK_FOREIGN_KEYS.items():
             existing = self._get_foreign_key("document_chunks", name)
@@ -275,6 +283,7 @@ class MySQLMetadataStore:
                 continue
             if existing:
                 raise RuntimeError(f"unexpected document_chunks foreign key shape: {name}")
+            self._backfill_missing_document_versions()
             column_sql = ", ".join(columns)
             referenced_sql = ", ".join(referenced_columns)
             self._execute_chunk_ddl(
@@ -282,6 +291,68 @@ class MySQLMetadataStore:
                 f"FOREIGN KEY ({column_sql}) REFERENCES {referenced_table} ({referenced_sql}) ON DELETE CASCADE",
                 {1826},
             )
+            if self._get_foreign_key("document_chunks", name) != expected:
+                raise RuntimeError(f"document_chunks foreign key shape did not match after migration: {name}")
+
+    def _document_chunks_primary_matches(self) -> bool:
+        row_id = self._get_column("document_chunks", "row_id")
+        return bool(
+            row_id
+            and "auto_increment" in (row_id.get("EXTRA") or "").lower()
+            and self._get_index_columns("document_chunks", "PRIMARY") == ("row_id",)
+        )
+
+    def _backfill_missing_document_versions(self):
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO document_versions
+                    (version_id, doc_id, version, content_hash, parser_version,
+                     parsed_artifact_path, status, created_at)
+                SELECT
+                    SHA2(CONCAT('legacy:', dc.doc_id, ':', dc.document_version), 256),
+                    dc.doc_id,
+                    dc.document_version,
+                    d.content_hash,
+                    d.parser_version,
+                    d.parsed_artifact_path,
+                    CASE WHEN d.current_version=dc.document_version THEN 'active' ELSE 'inactive' END,
+                    COALESCE(d.created_at, NOW(3))
+                FROM (
+                    SELECT DISTINCT doc_id, document_version FROM document_chunks
+                ) dc
+                INNER JOIN documents d ON d.doc_id=dc.doc_id
+                LEFT JOIN document_versions dv
+                    ON dv.doc_id=dc.doc_id AND dv.version=dc.document_version
+                WHERE dv.doc_id IS NULL
+                """
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS missing_count
+                FROM (
+                    SELECT DISTINCT doc_id, document_version FROM document_chunks
+                ) dc
+                LEFT JOIN document_versions dv
+                    ON dv.doc_id=dc.doc_id AND dv.version=dc.document_version
+                WHERE dv.doc_id IS NULL
+                """
+            )
+            missing_count = int((cur.fetchone() or {}).get("missing_count") or 0)
+        finally:
+            cur.close()
+        if missing_count:
+            raise RuntimeError("document version backfill left chunk versions unresolved")
 
     def _get_column(self, table: str, column: str) -> dict | None:
         if table != "document_chunks" or column not in {"row_id", "chunk_id"}:
@@ -313,6 +384,24 @@ class MySQLMetadataStore:
                 (table, name),
             )
             return tuple(row["COLUMN_NAME"] for row in cur.fetchall())
+        finally:
+            cur.close()
+
+    def _index_is_unique(self, table: str, name: str) -> bool:
+        if table != "document_chunks" or name not in _CHUNK_INDEXES:
+            raise ValueError("index uniqueness lookup is not allowed")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT NON_UNIQUE FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s
+                LIMIT 1
+                """,
+                (table, name),
+            )
+            row = cur.fetchone()
+            return bool(row is not None and int(row["NON_UNIQUE"]) == 0)
         finally:
             cur.close()
 
@@ -401,13 +490,31 @@ class MySQLMetadataStore:
         if present:
             return
         cur = self._conn.cursor()
+        duplicate_race = False
         try:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         except Exception as exc:
             if not exc.args or exc.args[0] != 1060:
                 raise
+            duplicate_race = True
         finally:
             cur.close()
+        if duplicate_race:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT 1 AS present FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
+                    LIMIT 1
+                    """,
+                    (table, column),
+                )
+                present = cur.fetchone()
+            finally:
+                cur.close()
+            if not present:
+                raise RuntimeError(f"duplicate column race did not produce expected column: {table}.{column}")
 
     @staticmethod
     def _dt(value: Any) -> str:

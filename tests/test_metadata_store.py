@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from KBzhy.app.core.metadata_store import MySQLMetadataStore
@@ -77,18 +79,49 @@ class SchemaConnection:
                 normalized = " ".join(sql.split())
                 connection.executed.append((normalized, params))
                 self._row = None
+                self._rows = []
                 if normalized.startswith("CREATE TABLE") and connection.statement_error:
                     raise connection.statement_error
                 if "INFORMATION_SCHEMA.COLUMNS" in normalized:
-                    self._row = {"present": 1} if tuple(params) in connection.existing_columns else None
+                    if tuple(params) == ("document_chunks", "row_id"):
+                        self._row = {"IS_NULLABLE": "NO", "EXTRA": "auto_increment"}
+                    elif tuple(params) == ("document_chunks", "chunk_id"):
+                        self._row = {"IS_NULLABLE": "NO", "EXTRA": ""}
+                    else:
+                        self._row = {"present": 1} if tuple(params) in connection.existing_columns else None
+                elif "INFORMATION_SCHEMA.STATISTICS" in normalized:
+                    indexes = {
+                        "PRIMARY": ("row_id",),
+                        "uq_chunks_task_chunk": ("task_id", "chunk_id"),
+                        "idx_chunks_doc_active_children": ("doc_id", "status", "chunk_type", "position"),
+                        "idx_chunks_active_children": ("status", "chunk_type", "doc_id", "position"),
+                    }
+                    unique = params[1] in {"PRIMARY", "uq_chunks_task_chunk"}
+                    self._rows = [
+                        {"COLUMN_NAME": name, "NON_UNIQUE": 0 if unique else 1}
+                        for name in indexes.get(params[1], ())
+                    ]
+                    self._row = self._rows[0] if self._rows else None
+                elif "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in normalized:
+                    self._row = {"CONSTRAINT_TYPE": "FOREIGN KEY"}
+                elif "INFORMATION_SCHEMA.KEY_COLUMN_USAGE" in normalized:
+                    self._rows = [
+                        {"COLUMN_NAME": "doc_id", "REFERENCED_TABLE_NAME": "document_versions", "REFERENCED_COLUMN_NAME": "doc_id"},
+                        {"COLUMN_NAME": "document_version", "REFERENCED_TABLE_NAME": "document_versions", "REFERENCED_COLUMN_NAME": "version"},
+                    ]
+                elif "COUNT(*) AS missing_count" in normalized:
+                    self._row = {"missing_count": 0}
                 elif normalized.startswith("ALTER TABLE") and connection.alter_error:
+                    if connection.alter_error.args[0] == 1060:
+                        parts = normalized.split()
+                        connection.existing_columns.add((parts[2], parts[5]))
                     raise connection.alter_error
 
             def fetchone(self):
                 return self._row
 
             def fetchall(self):
-                return [self._row] if self._row else []
+                return getattr(self, "_rows", [self._row] if self._row else [])
 
             def close(self):
                 self.closed = True
@@ -210,6 +243,7 @@ class ChunkShapeConnection:
         self.indexes = {
             "idx_chunks_active_children": ("status", "chunk_type", "position"),
         }
+        self.index_unique = {"idx_chunks_active_children": False}
         self.foreign_keys = {}
         if current:
             self.columns["row_id"] = {"IS_NULLABLE": "NO", "EXTRA": "auto_increment"}
@@ -219,6 +253,11 @@ class ChunkShapeConnection:
                 "idx_chunks_doc_active_children": ("doc_id", "status", "chunk_type", "position"),
                 "idx_chunks_active_children": ("status", "chunk_type", "doc_id", "position"),
             }
+            self.index_unique = {
+                "uq_chunks_task_chunk": True,
+                "idx_chunks_doc_active_children": False,
+                "idx_chunks_active_children": False,
+            }
             self.foreign_keys["fk_document_chunks_version"] = (
                 ("doc_id", "document_version"),
                 "document_versions",
@@ -226,9 +265,22 @@ class ChunkShapeConnection:
             )
         self.executed = []
         self.alter_errors = {}
+        self.alter_races = {}
+        self.chunk_versions = {("doc-legacy", 7)} if not current else set()
+        self.document_versions = set()
+        self.version_rows = []
+        self.commits = 0
+        self.events = []
 
     def cursor(self):
         return ChunkShapeCursor(self)
+
+    def commit(self):
+        self.commits += 1
+        self.events.append("commit")
+
+    def rollback(self):
+        pass
 
 
 class ChunkShapeCursor:
@@ -239,6 +291,8 @@ class ChunkShapeCursor:
     def execute(self, sql, params=()):
         normalized = " ".join(sql.split())
         self.connection.executed.append((normalized, params))
+        if normalized.startswith("ALTER TABLE"):
+            self.connection.events.append(normalized)
         if "INFORMATION_SCHEMA.COLUMNS" in normalized:
             column = self.connection.columns.get(params[1])
             self.rows = [column] if column else []
@@ -247,7 +301,8 @@ class ChunkShapeCursor:
                 columns = self.connection.primary
             else:
                 columns = self.connection.indexes.get(params[1], ())
-            self.rows = [{"COLUMN_NAME": name} for name in columns]
+            unique = params[1] == "PRIMARY" or self.connection.index_unique.get(params[1], False)
+            self.rows = [{"COLUMN_NAME": name, "NON_UNIQUE": 0 if unique else 1} for name in columns]
         elif "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in normalized:
             self.rows = (
                 [{"CONSTRAINT_TYPE": "FOREIGN KEY"}]
@@ -268,7 +323,22 @@ class ChunkShapeCursor:
                 ]
             else:
                 self.rows = []
+        elif normalized.startswith("INSERT INTO document_versions"):
+            for doc_id, version in sorted(self.connection.chunk_versions - self.connection.document_versions):
+                version_id = hashlib.sha256(f"legacy:{doc_id}:{version}".encode()).hexdigest()
+                self.connection.document_versions.add((doc_id, version))
+                self.connection.version_rows.append(
+                    {"version_id": version_id, "doc_id": doc_id, "version": version}
+                )
+            self.rows = []
+        elif "COUNT(*) AS missing_count" in normalized:
+            missing = self.connection.chunk_versions - self.connection.document_versions
+            self.rows = [{"missing_count": len(missing)}]
         elif normalized.startswith("ALTER TABLE document_chunks"):
+            for marker, (error, apply_race) in self.connection.alter_races.items():
+                if marker in normalized:
+                    apply_race(self.connection)
+                    raise error
             for marker, error in self.connection.alter_errors.items():
                 if marker in normalized:
                     raise error
@@ -285,12 +355,14 @@ class ChunkShapeCursor:
             connection.columns["chunk_id"]["IS_NULLABLE"] = "NO"
         if "ADD UNIQUE KEY uq_chunks_task_chunk" in sql:
             connection.indexes["uq_chunks_task_chunk"] = ("task_id", "chunk_id")
+            connection.index_unique["uq_chunks_task_chunk"] = True
         if "ADD INDEX idx_chunks_doc_active_children" in sql:
             connection.indexes["idx_chunks_doc_active_children"] = ("doc_id", "status", "chunk_type", "position")
         if "ADD INDEX idx_chunks_active_children" in sql:
             connection.indexes["idx_chunks_active_children"] = ("status", "chunk_type", "doc_id", "position")
         if "DROP INDEX idx_chunks_active_children" in sql:
             connection.indexes.pop("idx_chunks_active_children", None)
+            connection.index_unique.pop("idx_chunks_active_children", None)
         if "ADD CONSTRAINT fk_document_chunks_version" in sql:
             connection.foreign_keys["fk_document_chunks_version"] = (
                 ("doc_id", "document_version"),
@@ -324,6 +396,10 @@ def test_document_chunks_shape_migrates_legacy_primary_key_and_objects():
         "document_versions",
         ("doc_id", "version"),
     )
+    assert store._conn.document_versions == {("doc-legacy", 7)}
+    assert len(store._conn.version_rows[0]["version_id"]) == 64
+    fk_event = next(i for i, event in enumerate(store._conn.events) if "ADD CONSTRAINT fk_document_chunks_version" in event)
+    assert "commit" in store._conn.events[:fk_event]
     alter_sql = [sql for sql, _ in store._conn.executed if sql.startswith("ALTER TABLE")]
     assert any("DROP PRIMARY KEY, ADD COLUMN row_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST" in sql for sql in alter_sql)
     store._conn.executed.clear()
@@ -377,3 +453,147 @@ def test_chunk_shape_migration_does_not_hide_failed_legacy_index_drop():
         store._ensure_document_chunks_shape()
 
     assert exc_info.value.args[0] == 1091
+
+
+def test_document_version_backfill_is_idempotent():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection()
+
+    store._backfill_missing_document_versions()
+    first_rows = list(store._conn.version_rows)
+    store._backfill_missing_document_versions()
+
+    assert store._conn.version_rows == first_rows
+    assert store._conn.commits == 2
+
+
+def test_duplicate_index_errno_rechecks_and_accepts_matching_race_shape():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.indexes.pop("idx_chunks_doc_active_children")
+    store._conn.alter_races["ADD INDEX idx_chunks_doc_active_children"] = (
+        RuntimeError(1061, "Duplicate key"),
+        lambda connection: connection.indexes.__setitem__(
+            "idx_chunks_doc_active_children", ("doc_id", "status", "chunk_type", "position")
+        ),
+    )
+
+    store._ensure_document_chunks_shape()
+
+
+def test_duplicate_index_errno_rechecks_and_rejects_wrong_race_shape():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.indexes.pop("idx_chunks_doc_active_children")
+    store._conn.alter_races["ADD INDEX idx_chunks_doc_active_children"] = (
+        RuntimeError(1061, "Duplicate key"),
+        lambda connection: connection.indexes.__setitem__(
+            "idx_chunks_doc_active_children", ("doc_id", "status")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="index shape"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_primary_errno_rechecks_and_rejects_non_auto_increment_row_id():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection()
+
+    def apply_wrong_primary(connection):
+        connection.columns["row_id"] = {"IS_NULLABLE": "NO", "EXTRA": ""}
+        connection.primary = ("row_id",)
+
+    store._conn.alter_races["DROP PRIMARY KEY"] = (
+        RuntimeError(1060, "Duplicate column"),
+        apply_wrong_primary,
+    )
+
+    with pytest.raises(RuntimeError, match="primary key"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_primary_errno_rechecks_and_accepts_matching_race_shape():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection()
+
+    def apply_expected_primary(connection):
+        connection.columns["row_id"] = {"IS_NULLABLE": "NO", "EXTRA": "auto_increment"}
+        connection.primary = ("row_id",)
+
+    store._conn.alter_races["DROP PRIMARY KEY"] = (
+        RuntimeError(1060, "Duplicate column"),
+        apply_expected_primary,
+    )
+
+    store._ensure_document_chunks_shape()
+
+
+def test_duplicate_unique_errno_rechecks_and_rejects_reversed_columns():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.indexes.pop("uq_chunks_task_chunk")
+    store._conn.alter_races["ADD UNIQUE KEY uq_chunks_task_chunk"] = (
+        RuntimeError(1061, "Duplicate key"),
+        lambda connection: connection.indexes.__setitem__(
+            "uq_chunks_task_chunk", ("chunk_id", "task_id")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="index shape"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_unique_errno_rechecks_and_accepts_matching_columns():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.indexes.pop("uq_chunks_task_chunk")
+    store._conn.alter_races["ADD UNIQUE KEY uq_chunks_task_chunk"] = (
+        RuntimeError(1061, "Duplicate key"),
+        lambda connection: (
+            connection.indexes.__setitem__("uq_chunks_task_chunk", ("task_id", "chunk_id")),
+            connection.index_unique.__setitem__("uq_chunks_task_chunk", True),
+        ),
+    )
+
+    store._ensure_document_chunks_shape()
+
+
+def test_existing_nonunique_task_chunk_index_is_rejected():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.index_unique["uq_chunks_task_chunk"] = False
+
+    with pytest.raises(RuntimeError, match="index shape"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_foreign_key_errno_rechecks_and_rejects_wrong_reference():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.foreign_keys.clear()
+    store._conn.alter_races["ADD CONSTRAINT fk_document_chunks_version"] = (
+        RuntimeError(1826, "Duplicate foreign key"),
+        lambda connection: connection.foreign_keys.__setitem__(
+            "fk_document_chunks_version",
+            (("doc_id",), "documents", ("doc_id",)),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="foreign key shape"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_foreign_key_errno_rechecks_and_accepts_matching_reference():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.foreign_keys.clear()
+    store._conn.alter_races["ADD CONSTRAINT fk_document_chunks_version"] = (
+        RuntimeError(1826, "Duplicate foreign key"),
+        lambda connection: connection.foreign_keys.__setitem__(
+            "fk_document_chunks_version",
+            (("doc_id", "document_version"), "document_versions", ("doc_id", "version")),
+        ),
+    )
+
+    store._ensure_document_chunks_shape()
