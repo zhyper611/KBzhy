@@ -198,14 +198,18 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
         else:
             store.create_document(doc_data)
             store.create_task(task_data)
-        get_indexing_worker().enqueue(task_id)
-        logger.info("文档已入队: kb=%s doc=%s task=%s filename=%s", kb_id, doc_id, task_id, filename)
-        return _to_document_info(doc_data)
     except HTTPException:
         raise
     except Exception as exc:
         shutil.rmtree(Path(UPLOAD_STORAGE_DIR) / kb_id / doc_id, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"文档入队失败: {exc}") from exc
+
+    try:
+        get_indexing_worker().enqueue(task_id)
+    except Exception as exc:
+        logger.warning("文档任务已持久化但内存入队失败，等待恢复: task=%s error=%s", task_id, exc)
+    logger.info("文档已入队: kb=%s doc=%s task=%s filename=%s", kb_id, doc_id, task_id, filename)
+    return _to_document_info(doc_data)
 
 
 @router.put("/knowledge-bases/{kb_id}/documents/{doc_id}", response_model=DocumentUpdateResponse)
@@ -261,7 +265,7 @@ async def update_document(kb_id: str, doc_id: str, file: UploadFile = File(...))
     try:
         get_indexing_worker().enqueue(task_id)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"文档更新入队失败: {exc}") from exc
+        logger.warning("文档更新任务已持久化但内存入队失败，等待恢复: task=%s error=%s", task_id, exc)
 
     return DocumentUpdateResponse(
         id=doc_id,

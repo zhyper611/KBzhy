@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -704,6 +706,7 @@ class DocumentTransactionConnection:
         self.executed = []
         self.commits = 0
         self.rollbacks = 0
+        self.closed = False
 
     def cursor(self):
         connection = self
@@ -735,10 +738,28 @@ class DocumentTransactionConnection:
     def rollback(self):
         self.rollbacks += 1
 
+    def close(self):
+        self.closed = True
+
+
+def _store_with_connection_factory(*, max_version=1, fail_on=None):
+    store = object.__new__(MySQLMetadataStore)
+    connections = []
+
+    def create_connection():
+        connection = DocumentTransactionConnection(max_version=max_version, fail_on=fail_on)
+        connections.append(connection)
+        return connection
+
+    store.create_connection = create_connection
+    store._conn = type("ForbiddenSharedConnection", (), {
+        "cursor": lambda self: (_ for _ in ()).throw(AssertionError("shared connection must not be used")),
+    })()
+    return store, connections
+
 
 def test_create_document_version_and_task_locks_document_and_uses_max_version():
-    store = object.__new__(MySQLMetadataStore)
-    store._conn = DocumentTransactionConnection(max_version=4)
+    store, connections = _store_with_connection_factory(max_version=4)
 
     version = store.create_document_version_and_task(
         "doc1", "kb1", "new-hash", "/uploads/kb1/doc1/task2/new.txt",
@@ -746,24 +767,26 @@ def test_create_document_version_and_task_locks_document_and_uses_max_version():
     )
 
     assert version == 5
-    sql = [statement for statement, _ in store._conn.executed]
+    assert len(connections) == 1
+    connection = connections[0]
+    sql = [statement for statement, _ in connection.executed]
     assert any(statement.endswith("FOR UPDATE") for statement in sql)
     assert any("SELECT COALESCE(MAX(version), 0) AS max_version" in statement for statement in sql)
-    version_insert = next((statement, params) for statement, params in store._conn.executed if statement.startswith("INSERT INTO document_versions"))
+    version_insert = next((statement, params) for statement, params in connection.executed if statement.startswith("INSERT INTO document_versions"))
     assert version_insert[1][2] == 5
     assert version_insert[1][3] == "new-hash"
-    task_insert = next((statement, params) for statement, params in store._conn.executed if statement.startswith("INSERT INTO document_index_tasks"))
+    task_insert = next((statement, params) for statement, params in connection.executed if statement.startswith("INSERT INTO document_index_tasks"))
     assert task_insert[1][-3:-1] == (5, 1)
     document_update = next(statement for statement in sql if statement.startswith("UPDATE documents"))
     assert "current_version" not in document_update
     assert "content_hash" not in document_update
-    assert store._conn.commits == 1
-    assert store._conn.rollbacks == 0
+    assert connection.commits == 1
+    assert connection.rollbacks == 0
+    assert connection.closed is True
 
 
 def test_create_document_version_and_task_rolls_back_all_writes():
-    store = object.__new__(MySQLMetadataStore)
-    store._conn = DocumentTransactionConnection(fail_on="INSERT INTO document_index_tasks")
+    store, connections = _store_with_connection_factory(fail_on="INSERT INTO document_index_tasks")
 
     with pytest.raises(RuntimeError, match="write failed"):
         store.create_document_version_and_task(
@@ -771,13 +794,13 @@ def test_create_document_version_and_task_rolls_back_all_writes():
             "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
         )
 
-    assert store._conn.commits == 0
-    assert store._conn.rollbacks == 1
+    assert connections[0].commits == 0
+    assert connections[0].rollbacks == 1
+    assert connections[0].closed is True
 
 
 def test_create_document_with_task_creates_v1_staging_and_versioned_task():
-    store = object.__new__(MySQLMetadataStore)
-    store._conn = DocumentTransactionConnection(max_version=0)
+    store, connections = _store_with_connection_factory(max_version=0)
     document = {
         "id": "doc-new", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
         "status": "queued", "chunk_count": 0, "task_id": "task1", "storage_path": "/uploads/v1/guide.txt",
@@ -790,7 +813,9 @@ def test_create_document_with_task_creates_v1_staging_and_versioned_task():
 
     store.create_document_with_task(document, task)
 
-    statements = store._conn.executed
+    assert len(connections) == 1
+    connection = connections[0]
+    statements = connection.executed
     document_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO documents"))
     assert document_insert[1][9:12] == (None, 0, 0)
     version_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO document_versions"))
@@ -798,6 +823,118 @@ def test_create_document_with_task_creates_v1_staging_and_versioned_task():
     assert version_insert[1][-2] == "staging"
     task_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO document_index_tasks"))
     assert task_insert[1][-3:-1] == (1, 1)
+    assert connection.commits == 1
+    assert connection.closed is True
+
+
+def test_create_document_with_task_rolls_back_and_closes_independent_connection():
+    store, connections = _store_with_connection_factory(fail_on="INSERT INTO document_versions")
+    document = {
+        "id": "doc-new", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
+        "status": "queued", "task_id": "task1", "storage_path": "/uploads/v1/guide.txt",
+        "content_hash": "hash-v1", "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }
+    task = {
+        "task_id": "task1", "doc_id": "doc-new", "kb_id": "kb1", "status": "queued",
+        "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        store.create_document_with_task(document, task)
+
+    assert len(connections) == 1
+    assert connections[0].commits == 0
+    assert connections[0].rollbacks == 1
+    assert connections[0].closed is True
+
+
+class ConcurrentVersionDatabase:
+    def __init__(self):
+        self.document_lock = threading.Lock()
+        self.attempt_lock = threading.Lock()
+        self.second_lock_attempt = threading.Event()
+        self.lock_attempts = 0
+        self.versions = [1]
+        self.connections = []
+
+    def connect(self):
+        connection = ConcurrentVersionConnection(self)
+        self.connections.append(connection)
+        return connection
+
+
+class ConcurrentVersionConnection:
+    def __init__(self, database):
+        self.database = database
+        self.locked = False
+        self.closed = False
+        self.row = None
+        self.pending_version = None
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT doc_id"):
+            with self.database.attempt_lock:
+                self.database.lock_attempts += 1
+                first_attempt = self.database.lock_attempts == 1
+                if self.database.lock_attempts == 2:
+                    self.database.second_lock_attempt.set()
+            self.database.document_lock.acquire()
+            self.locked = True
+            if first_attempt:
+                assert self.database.second_lock_attempt.wait(timeout=2)
+            self.row = {"doc_id": "doc1", "current_version": 1, "content_hash": "active"}
+        elif normalized.startswith("SELECT COALESCE(MAX(version)"):
+            self.row = {"max_version": max(self.database.versions)}
+        elif normalized.startswith("INSERT INTO document_versions"):
+            self.pending_version = params[2]
+            self.row = None
+        else:
+            self.row = None
+
+    def fetchone(self):
+        return self.row
+
+    def commit(self):
+        if self.pending_version is not None:
+            self.database.versions.append(self.pending_version)
+            self.pending_version = None
+        self._release_lock()
+
+    def rollback(self):
+        self.pending_version = None
+        self._release_lock()
+
+    def _release_lock(self):
+        if self.locked:
+            self.locked = False
+            self.database.document_lock.release()
+
+    def close(self):
+        self.closed = True
+
+
+def test_concurrent_document_updates_use_independent_locked_transactions_for_continuous_versions():
+    database = ConcurrentVersionDatabase()
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = database.connect
+
+    def create_version(task_number):
+        return store.create_document_version_and_task(
+            "doc1", "kb1", f"hash-{task_number}", f"/uploads/task-{task_number}/new.txt",
+            "new.txt", ".txt", f"task-{task_number}", "2026-08-13T10:00:00",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        versions = list(executor.map(create_version, (1, 2)))
+
+    assert sorted(versions) == [2, 3]
+    assert sorted(database.versions) == [1, 2, 3]
+    assert len(database.connections) == 2
+    assert all(connection.closed for connection in database.connections)
 
 
 def test_find_document_by_hash_matches_active_or_staging_hash_and_excludes_deleting():

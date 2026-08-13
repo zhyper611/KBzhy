@@ -671,8 +671,10 @@ class MySQLMetadataStore:
         self._conn.commit()
 
     def create_document_with_task(self, document: dict, task: dict):
-        cur = self._conn.cursor()
+        conn = self.create_connection()
+        cur = None
         try:
+            cur = conn.cursor()
             cur.execute(
                 """
                 INSERT INTO documents
@@ -739,12 +741,14 @@ class MySQLMetadataStore:
                     task.get("attempt_count", 0),
                 ),
             )
-            self._conn.commit()
+            conn.commit()
         except Exception:
-            self._conn.rollback()
+            conn.rollback()
             raise
         finally:
-            cur.close()
+            if cur is not None:
+                cur.close()
+            conn.close()
 
     def find_document_by_hash(
         self,
@@ -792,8 +796,10 @@ class MySQLMetadataStore:
         task_id: str,
         now: str,
     ) -> int:
-        cur = self._conn.cursor()
+        conn = self.create_connection()
+        cur = None
         try:
+            cur = conn.cursor()
             cur.execute(
                 "SELECT doc_id, current_version, content_hash FROM documents "
                 "WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
@@ -844,13 +850,15 @@ class MySQLMetadataStore:
                     self._mysql_dt(now), self._mysql_dt(now), new_version, 1, 0,
                 ),
             )
-            self._conn.commit()
+            conn.commit()
             return new_version
         except Exception:
-            self._conn.rollback()
+            conn.rollback()
             raise
         finally:
-            cur.close()
+            if cur is not None:
+                cur.close()
+            conn.close()
 
     def update_document(self, doc_id: str, **changes):
         if not changes:

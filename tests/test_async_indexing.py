@@ -184,6 +184,42 @@ def test_upload_duplicate_returns_structured_409_without_writing_or_enqueueing(m
     assert list(tmp_path.rglob("*")) == []
 
 
+def test_upload_enqueue_failure_keeps_queued_task_and_file(monkeypatch, tmp_path):
+    store = InMemoryStore()
+
+    class FailingWorker:
+        def enqueue(self, task_id):
+            raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_indexing_worker", lambda: FailingWorker())
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    response = asyncio.run(documents.upload_document("kb1", FakeUploadFile("guide.txt", b"content")))
+
+    assert response.status.value == "queued"
+    assert store.tasks[response.task_id]["status"] == "queued"
+    assert Path(store.documents[response.id]["storage_path"]).read_bytes() == b"content"
+
+
+def test_upload_transaction_failure_removes_new_document_directory(monkeypatch, tmp_path):
+    class FailingStore(InMemoryStore):
+        def create_document_with_task(self, document, task):
+            raise RuntimeError("database unavailable")
+
+    store = FailingStore()
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(documents.HTTPException) as exc_info:
+        asyncio.run(documents.upload_document("kb1", FakeUploadFile("guide.txt", b"content")))
+
+    assert exc_info.value.status_code == 500
+    assert list((tmp_path / "kb1").iterdir()) == []
+    assert store.documents == {}
+    assert store.tasks == {}
+
+
 def test_update_unchanged_document_is_noop(monkeypatch, tmp_path):
     store = InMemoryStore()
     content = b"unchanged"
@@ -278,6 +314,62 @@ def test_changed_update_preserves_active_file_and_index_and_creates_staging_vers
     assert response.task_id in staging["storage_path"]
     assert store.tasks[response.task_id]["document_version"] == 2
     assert queued == [response.task_id]
+
+
+def test_update_enqueue_failure_keeps_staging_task_and_files(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    old_path = tmp_path / "kb1" / "doc1" / "v1" / "old.txt"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(b"old")
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 2, "storage_path": str(old_path),
+        "content_hash": hashlib.sha256(b"old").hexdigest(), "current_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "content_hash": hashlib.sha256(b"old").hexdigest(), "storage_path": str(old_path), "status": "active",
+    }
+
+    class FailingWorker:
+        def enqueue(self, task_id):
+            raise RuntimeError("queue unavailable")
+
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_indexing_worker", lambda: FailingWorker())
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    response = asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("new.txt", b"new")))
+
+    assert response.status.value == "queued"
+    assert store.tasks[response.task_id]["status"] == "queued"
+    assert old_path.read_bytes() == b"old"
+    assert Path(store.versions[("doc1", 2)]["storage_path"]).read_bytes() == b"new"
+
+
+def test_update_transaction_failure_removes_only_new_task_directory(monkeypatch, tmp_path):
+    class FailingStore(InMemoryStore):
+        def create_document_version_and_task(self, *args, **kwargs):
+            raise RuntimeError("database unavailable")
+
+    store = FailingStore()
+    old_path = tmp_path / "kb1" / "doc1" / "v1" / "old.txt"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(b"old")
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 2, "storage_path": str(old_path),
+        "content_hash": hashlib.sha256(b"old").hexdigest(), "current_version": 1,
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(documents.HTTPException) as exc_info:
+        asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("new.txt", b"new")))
+
+    assert exc_info.value.status_code == 500
+    assert old_path.read_bytes() == b"old"
+    assert [path.name for path in old_path.parents[1].iterdir()] == ["v1"]
+    assert store.tasks == {}
 
 
 def test_indexing_worker_rolls_back_vectors_and_marks_failed(tmp_path):
