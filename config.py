@@ -40,6 +40,10 @@ UPLOAD_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "d
 # ====== 文档切分参数 ======
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
+PARENT_CHUNK_TOKENS = 2000
+CHILD_CHUNK_TOKENS = 400
+CONTEXT_TOKEN_BUDGET = 6000
+TOKEN_ENCODING = os.getenv("TOKEN_ENCODING", "cl100k_base")
 CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", "、", " ", ""]
 
 # ====== 检索参数 ======
