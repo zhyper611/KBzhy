@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -26,6 +27,8 @@ def stable_chunk_id(document_id: str, version: int, position: int, content: str)
 
 @dataclass(frozen=True)
 class DocumentElement:
+    __hash__ = None
+
     element_id: str
     element_type: ElementType
     text: str
@@ -35,9 +38,16 @@ class DocumentElement:
     bounding_box: dict[str, float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "section_path", tuple(self.section_path))
+        object.__setattr__(self, "bounding_box", deepcopy(self.bounding_box))
+        object.__setattr__(self, "metadata", deepcopy(self.metadata))
+
 
 @dataclass(frozen=True)
 class ParsedDocument:
+    __hash__ = None
+
     document_id: str
     version: int
     title: str
@@ -45,9 +55,15 @@ class ParsedDocument:
     elements: tuple[DocumentElement, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "elements", tuple(self.elements))
+        object.__setattr__(self, "metadata", deepcopy(self.metadata))
+
 
 @dataclass(frozen=True)
 class KnowledgeChunk:
+    __hash__ = None
+
     chunk_id: str
     document_id: str
     document_version: int
@@ -64,6 +80,12 @@ class KnowledgeChunk:
     index_version: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.chunk_type == "child" and not self.parent_chunk_id:
+            raise ValueError("parent_chunk_id is required for child chunks")
+        object.__setattr__(self, "section_path", tuple(self.section_path))
+        object.__setattr__(self, "metadata", deepcopy(self.metadata))
+
     @classmethod
     def child(
         cls,
@@ -73,13 +95,15 @@ class KnowledgeChunk:
         content: str,
         position: int,
         token_count: int,
+        parent_chunk_id: str,
         index_version: int = 1,
         section_path: list[str] | tuple[str, ...] = (),
-        parent_chunk_id: str | None = None,
         page_start: int | None = None,
         page_end: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> KnowledgeChunk:
+        if not parent_chunk_id:
+            raise ValueError("parent_chunk_id is required for child chunks")
         path = tuple(section_path)
         path_text = " > ".join(path)
         retrieval_text = f"{path_text}\n\n{content}" if path_text else content
