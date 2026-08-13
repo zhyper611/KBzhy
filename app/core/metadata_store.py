@@ -66,6 +66,9 @@ class MySQLMetadataStore:
     def _connect(self):
         return self._pymysql.connect(**self._connect_kwargs)
 
+    def create_connection(self):
+        return self._connect()
+
     def _reconnect(self):
         try:
             self._conn.close()
@@ -159,7 +162,8 @@ class MySQLMetadataStore:
             """,
             """
             CREATE TABLE IF NOT EXISTS document_chunks (
-                chunk_id VARCHAR(64) PRIMARY KEY,
+                row_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                chunk_id VARCHAR(64) NOT NULL,
                 task_id VARCHAR(128) NOT NULL,
                 doc_id VARCHAR(128) NOT NULL,
                 document_version INT NOT NULL,
@@ -178,19 +182,24 @@ class MySQLMetadataStore:
                 metadata_json LONGTEXT NOT NULL,
                 created_at DATETIME(3) NOT NULL,
                 updated_at DATETIME(3) NOT NULL,
+                UNIQUE KEY uq_chunks_task_chunk (task_id, chunk_id),
                 INDEX idx_chunks_doc_version_position (doc_id, document_version, position),
+                INDEX idx_chunks_doc_active_children (doc_id, status, chunk_type, position),
+                INDEX idx_chunks_active_children (status, chunk_type, position),
                 INDEX idx_chunks_parent (parent_chunk_id),
                 INDEX idx_chunks_status_index (status, index_version),
                 INDEX idx_chunks_task (task_id),
-                CONSTRAINT fk_document_chunks_doc FOREIGN KEY (doc_id)
-                    REFERENCES documents(doc_id) ON DELETE CASCADE
+                CONSTRAINT fk_document_chunks_version FOREIGN KEY (doc_id, document_version)
+                    REFERENCES document_versions(doc_id, version) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
         ]
         for sql in statements:
             cur = self._conn.cursor()
-            cur.execute(sql)
-            cur.close()
+            try:
+                cur.execute(sql)
+            finally:
+                cur.close()
         for (table, column), ddl in _COLUMN_MIGRATIONS.items():
             self._ensure_column(table, column, ddl)
         self._conn.commit()
@@ -199,22 +208,29 @@ class MySQLMetadataStore:
         if _COLUMN_MIGRATIONS.get((table, column)) != ddl:
             raise ValueError("column migration is not allowed")
         cur = self._conn.cursor()
-        cur.execute(
-            """
-            SELECT 1 AS present
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
-            LIMIT 1
-            """,
-            (table, column),
-        )
-        present = cur.fetchone()
-        cur.close()
+        try:
+            cur.execute(
+                """
+                SELECT 1 AS present
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
+                LIMIT 1
+                """,
+                (table, column),
+            )
+            present = cur.fetchone()
+        finally:
+            cur.close()
         if present:
             return
         cur = self._conn.cursor()
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-        cur.close()
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        except Exception as exc:
+            if not exc.args or exc.args[0] != 1060:
+                raise
+        finally:
+            cur.close()
 
     @staticmethod
     def _dt(value: Any) -> str:

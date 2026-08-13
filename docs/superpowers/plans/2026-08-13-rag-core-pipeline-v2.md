@@ -276,7 +276,7 @@ document_index_tasks.document_version/index_version/attempt_count
 
 - [ ] **Step 4: 实现 ChunkRepository 的事务接口**
 
-至少提供以下精确接口：`replace_staging(task_id, document_id, version, chunks)`、`activate_version(document_id, version)`、`discard_task(task_id)`、`list_active_children(document_id=None)`、`get_context_family(chunk_id, neighbor_window=1)`、`get_active_versions(document_ids)`。返回值分别为 `None`、`None`、`None`、`list[KnowledgeChunk]`、`ContextFamily` 和 `dict[str, int]`。
+至少提供以下精确接口：`replace_staging(task_id, document_id, version, chunks)`、`activate_version(document_id, version, task_id)`、`discard_task(task_id)`、`list_active_children(document_id=None)`、`get_context_family(chunk_id, neighbor_window=1)`、`get_active_versions(document_ids)`。返回值分别为 `None`、`None`、`None`、`list[KnowledgeChunk]`、`ContextFamily` 和 `dict[str, int]`。
 
 `replace_staging()` 必须在一个 MySQL 事务中先删除同 `task_id` staging 行再批量插入，Parent 和 Child 都写入 MySQL。
 
