@@ -8,7 +8,10 @@ frontend/dist/
 chroma_db/
 None/
 data/conversations/
+data/uploads/
+data/parsed/
 data/*.json
 data/*.bak
+data/*.migrated
 
 .env

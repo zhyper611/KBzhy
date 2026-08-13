@@ -238,3 +238,7 @@ def test_legacy_json_metadata_migration_imports_kbs_and_documents(monkeypatch, t
     assert ("kb1", "Legacy KB", "old", MySQLMetadataStore._mysql_dt("2026-06-12T10:00:00")) in params
     assert any(p and p[0] == "doc1" and p[1] == "kb1" and p[2] == "guide.pdf" and p[5] == 3 for p in params)
     assert ("COMMIT", None) in executed
+    assert not (data_dir / "kb_meta.json").exists()
+    assert not (data_dir / "doc_registry.json").exists()
+    assert (data_dir / "kb_meta.json.migrated").exists()
+    assert (data_dir / "doc_registry.json.migrated").exists()

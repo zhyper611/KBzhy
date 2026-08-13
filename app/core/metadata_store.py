@@ -481,10 +481,18 @@ class MySQLMetadataStore:
                         ),
                     )
             self._conn.commit()
+            self._archive_legacy_json(kb_meta_path)
+            self._archive_legacy_json(doc_registry_path)
             logger.info("Legacy JSON metadata migration completed")
         except Exception as exc:
             self._conn.rollback()
             logger.warning("Legacy JSON metadata migration failed: %s", exc)
+
+    @staticmethod
+    def _archive_legacy_json(path: str):
+        if not os.path.exists(path):
+            return
+        os.replace(path, f"{path}.migrated")
 
     @staticmethod
     def _load_json(path: str, default: dict) -> dict:
