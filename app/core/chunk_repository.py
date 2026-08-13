@@ -89,9 +89,9 @@ class ChunkRepository:
             cur.execute(
                 """
                 UPDATE document_chunks SET status='inactive', updated_at=NOW(3)
-                WHERE doc_id=%s AND status='active' AND document_version<>%s
+                WHERE doc_id=%s AND status='active'
                 """,
-                (document_id, version),
+                (document_id,),
             )
             cur.execute(
                 """

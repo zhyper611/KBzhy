@@ -85,9 +85,10 @@ class MemoryCursor:
         elif normalized.startswith("SELECT"):
             self.results = self._select(normalized, params)
         elif normalized.startswith("UPDATE document_chunks SET status='inactive'"):
-            doc_id, version = params
+            doc_id = params[0]
             for row in self.connection.rows:
-                if row["doc_id"] == doc_id and row["status"] == "active" and row["document_version"] != version:
+                version_matches = len(params) == 1 or row["document_version"] != params[1]
+                if row["doc_id"] == doc_id and row["status"] == "active" and version_matches:
                     row["status"] = "inactive"
         elif normalized.startswith("UPDATE document_chunks SET status='active'"):
             doc_id, version = params
@@ -187,6 +188,28 @@ def test_activate_version_switches_status_and_updates_document_versions():
     assert {r["status"] for r in connection.rows if r["document_version"] == 1} == {"inactive"}
     assert {r["status"] for r in connection.rows if r["document_version"] == 2} == {"active"}
     assert connection.documents["doc-1"] == {"current_version": 2, "active_index_version": 5}
+
+
+def test_activate_version_deactivates_old_active_batch_of_same_version():
+    connection = MemoryConnection()
+    repo = ChunkRepository(connection)
+    old_chunks = [
+        make_parent("old-parent", version=2, index_version=4),
+        make_child("old-child", 0, version=2, parent_id="old-parent", index_version=4),
+    ]
+    repo.replace_staging("old-task", "doc-1", 2, old_chunks)
+    for row in connection.rows:
+        row["status"] = "active"
+    new_chunks = [
+        make_parent("new-parent", version=2, index_version=5),
+        make_child("new-child", 0, version=2, parent_id="new-parent", index_version=5),
+    ]
+    repo.replace_staging("new-task", "doc-1", 2, new_chunks)
+
+    repo.activate_version("doc-1", 2)
+
+    assert {row["status"] for row in connection.rows if row["task_id"] == "old-task"} == {"inactive"}
+    assert {row["status"] for row in connection.rows if row["task_id"] == "new-task"} == {"active"}
 
 
 @pytest.mark.parametrize("chunks", [[], [make_parent(version=2)]])
