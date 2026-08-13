@@ -8,7 +8,6 @@ from typing import Any, Literal
 
 ElementType = Literal["heading", "paragraph", "list", "table", "code"]
 ChunkType = Literal["parent", "child"]
-BoundingBox = tuple[float, float, float, float]
 
 
 def content_hash(content: str | bytes) -> str:
@@ -33,7 +32,7 @@ class DocumentElement:
     order: int
     page: int | None = None
     section_path: tuple[str, ...] = ()
-    bounding_box: BoundingBox | None = None
+    bounding_box: dict[str, float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -62,7 +61,7 @@ class KnowledgeChunk:
     page_end: int | None
     position: int
     token_count: int
-    index_version: str
+    index_version: int = 1
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -74,14 +73,15 @@ class KnowledgeChunk:
         content: str,
         position: int,
         token_count: int,
-        index_version: str,
-        section_path: tuple[str, ...] = (),
+        index_version: int = 1,
+        section_path: list[str] | tuple[str, ...] = (),
         parent_chunk_id: str | None = None,
         page_start: int | None = None,
         page_end: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> KnowledgeChunk:
-        path_text = " > ".join(section_path)
+        path = tuple(section_path)
+        path_text = " > ".join(path)
         retrieval_text = f"{path_text}\n\n{content}" if path_text else content
         return cls(
             chunk_id=stable_chunk_id(document_id, document_version, position, content),
@@ -92,7 +92,7 @@ class KnowledgeChunk:
             content=content,
             retrieval_text=retrieval_text,
             content_hash=content_hash(content),
-            section_path=section_path,
+            section_path=path,
             page_start=page_start,
             page_end=page_end,
             position=position,

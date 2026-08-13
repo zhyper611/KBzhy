@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from typing import get_type_hints
 
 import pytest
 
@@ -42,6 +43,21 @@ def test_document_element_is_frozen():
         element.text = "修改后的正文"
 
 
+def test_document_element_accepts_bounding_box_mapping():
+    bounding_box = {"x": 10.0, "y": 20.0, "width": 300.0, "height": 40.0}
+
+    element = DocumentElement(
+        element_id="element-1",
+        element_type="paragraph",
+        text="正文",
+        order=0,
+        bounding_box=bounding_box,
+    )
+
+    assert element.bounding_box == bounding_box
+    assert get_type_hints(DocumentElement)["bounding_box"] == dict[str, float] | None
+
+
 def test_knowledge_chunk_child_builds_retrieval_text_and_hashes():
     chunk = KnowledgeChunk.child(
         document_id="document-1",
@@ -50,7 +66,6 @@ def test_knowledge_chunk_child_builds_retrieval_text_and_hashes():
         section_path=("第一章", "检索"),
         position=4,
         token_count=8,
-        index_version="v2",
     )
 
     assert chunk.chunk_type == "child"
@@ -59,6 +74,8 @@ def test_knowledge_chunk_child_builds_retrieval_text_and_hashes():
     assert chunk.chunk_id == stable_chunk_id("document-1", 2, 4, "向量检索正文")
     assert len(chunk.chunk_id) == 64
     assert len(chunk.content_hash) == 64
+    assert chunk.index_version == 1
+    assert get_type_hints(KnowledgeChunk)["index_version"] is int
 
 
 def test_knowledge_chunk_child_without_section_uses_content_for_retrieval():
@@ -68,10 +85,23 @@ def test_knowledge_chunk_child_without_section_uses_content_for_retrieval():
         content="无标题正文",
         position=0,
         token_count=4,
-        index_version="v2",
     )
 
     assert chunk.retrieval_text == chunk.content
+
+
+def test_knowledge_chunk_child_normalizes_list_section_path_to_tuple():
+    chunk = KnowledgeChunk.child(
+        document_id="document-1",
+        document_version=1,
+        content="列表路径正文",
+        position=1,
+        token_count=5,
+        section_path=["第二章", "生成"],
+    )
+
+    assert chunk.section_path == ("第二章", "生成")
+    assert chunk.retrieval_text == "第二章 > 生成\n\n列表路径正文"
 
 
 def test_token_counter_truncate_never_exceeds_budget():
