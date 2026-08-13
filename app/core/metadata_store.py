@@ -30,6 +30,20 @@ _COLUMN_MIGRATIONS = {
     ("document_index_tasks", "attempt_count"): "INT NOT NULL DEFAULT 0",
 }
 
+_CHUNK_INDEXES = {
+    "uq_chunks_task_chunk": ("UNIQUE KEY", ("task_id", "chunk_id")),
+    "idx_chunks_doc_active_children": ("INDEX", ("doc_id", "status", "chunk_type", "position")),
+    "idx_chunks_active_children": ("INDEX", ("status", "chunk_type", "doc_id", "position")),
+}
+
+_CHUNK_FOREIGN_KEYS = {
+    "fk_document_chunks_version": (
+        ("doc_id", "document_version"),
+        "document_versions",
+        ("doc_id", "version"),
+    ),
+}
+
 
 class MetadataStoreUnavailable(RuntimeError):
     pass
@@ -185,7 +199,7 @@ class MySQLMetadataStore:
                 UNIQUE KEY uq_chunks_task_chunk (task_id, chunk_id),
                 INDEX idx_chunks_doc_version_position (doc_id, document_version, position),
                 INDEX idx_chunks_doc_active_children (doc_id, status, chunk_type, position),
-                INDEX idx_chunks_active_children (status, chunk_type, position),
+                INDEX idx_chunks_active_children (status, chunk_type, doc_id, position),
                 INDEX idx_chunks_parent (parent_chunk_id),
                 INDEX idx_chunks_status_index (status, index_version),
                 INDEX idx_chunks_task (task_id),
@@ -202,7 +216,170 @@ class MySQLMetadataStore:
                 cur.close()
         for (table, column), ddl in _COLUMN_MIGRATIONS.items():
             self._ensure_column(table, column, ddl)
+        self._ensure_document_chunks_shape()
         self._conn.commit()
+
+    def _ensure_document_chunks_shape(self):
+        row_id = self._get_column("document_chunks", "row_id")
+        primary_columns = self._get_index_columns("document_chunks", "PRIMARY")
+        if not row_id:
+            if primary_columns == ("chunk_id",):
+                self._execute_chunk_ddl(
+                    "ALTER TABLE document_chunks DROP PRIMARY KEY, "
+                    "ADD COLUMN row_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+                    {1060, 1068},
+                )
+            elif not primary_columns:
+                self._execute_chunk_ddl(
+                    "ALTER TABLE document_chunks "
+                    "ADD COLUMN row_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+                    {1060, 1068},
+                )
+            else:
+                raise RuntimeError("unsupported document_chunks primary key shape")
+        elif primary_columns != ("row_id",):
+            raise RuntimeError("row_id exists but is not the document_chunks primary key")
+
+        chunk_id = self._get_column("document_chunks", "chunk_id")
+        if chunk_id and chunk_id.get("IS_NULLABLE") != "NO":
+            self._execute_chunk_ddl(
+                "ALTER TABLE document_chunks MODIFY COLUMN chunk_id VARCHAR(64) NOT NULL",
+                set(),
+            )
+
+        for name, (kind, columns) in _CHUNK_INDEXES.items():
+            existing = self._get_index_columns("document_chunks", name)
+            if existing == columns:
+                continue
+            if existing:
+                legacy_global_index = (
+                    name == "idx_chunks_active_children"
+                    and existing == ("status", "chunk_type", "position")
+                )
+                if not legacy_global_index:
+                    raise RuntimeError(f"unexpected document_chunks index shape: {name}")
+                self._execute_chunk_ddl(
+                    "ALTER TABLE document_chunks DROP INDEX idx_chunks_active_children",
+                    set(),
+                )
+            column_sql = ", ".join(columns)
+            self._execute_chunk_ddl(
+                f"ALTER TABLE document_chunks ADD {kind} {name} ({column_sql})",
+                {1061},
+            )
+
+        for name, (columns, referenced_table, referenced_columns) in _CHUNK_FOREIGN_KEYS.items():
+            existing = self._get_foreign_key("document_chunks", name)
+            expected = (columns, referenced_table, referenced_columns)
+            if existing == expected:
+                continue
+            if existing:
+                raise RuntimeError(f"unexpected document_chunks foreign key shape: {name}")
+            column_sql = ", ".join(columns)
+            referenced_sql = ", ".join(referenced_columns)
+            self._execute_chunk_ddl(
+                f"ALTER TABLE document_chunks ADD CONSTRAINT {name} "
+                f"FOREIGN KEY ({column_sql}) REFERENCES {referenced_table} ({referenced_sql}) ON DELETE CASCADE",
+                {1826},
+            )
+
+    def _get_column(self, table: str, column: str) -> dict | None:
+        if table != "document_chunks" or column not in {"row_id", "chunk_id"}:
+            raise ValueError("column shape lookup is not allowed")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT IS_NULLABLE, EXTRA FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s
+                """,
+                (table, column),
+            )
+            return cur.fetchone()
+        finally:
+            cur.close()
+
+    def _get_index_columns(self, table: str, name: str) -> tuple[str, ...]:
+        if table != "document_chunks" or name not in {"PRIMARY", *_CHUNK_INDEXES}:
+            raise ValueError("index shape lookup is not allowed")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s
+                ORDER BY SEQ_IN_INDEX
+                """,
+                (table, name),
+            )
+            return tuple(row["COLUMN_NAME"] for row in cur.fetchall())
+        finally:
+            cur.close()
+
+    def _get_foreign_key(self, table: str, name: str):
+        if table != "document_chunks" or name not in _CHUNK_FOREIGN_KEYS:
+            raise ValueError("foreign key shape lookup is not allowed")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT CONSTRAINT_TYPE FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND CONSTRAINT_NAME=%s
+                """,
+                (table, name),
+            )
+            constraint = cur.fetchone()
+            if not constraint:
+                return None
+            if constraint["CONSTRAINT_TYPE"] != "FOREIGN KEY":
+                raise RuntimeError(f"unexpected document_chunks constraint type: {name}")
+            cur.execute(
+                """
+                SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND CONSTRAINT_NAME=%s
+                  AND REFERENCED_TABLE_NAME IS NOT NULL
+                ORDER BY ORDINAL_POSITION
+                """,
+                (table, name),
+            )
+            rows = cur.fetchall()
+        finally:
+            cur.close()
+        if not rows:
+            return None
+        return (
+            tuple(row["COLUMN_NAME"] for row in rows),
+            rows[0]["REFERENCED_TABLE_NAME"],
+            tuple(row["REFERENCED_COLUMN_NAME"] for row in rows),
+        )
+
+    def _execute_chunk_ddl(self, sql: str, ignored_errnos: set[int]):
+        allowed = {
+            "ALTER TABLE document_chunks DROP PRIMARY KEY, ADD COLUMN row_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+            "ALTER TABLE document_chunks ADD COLUMN row_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+            "ALTER TABLE document_chunks MODIFY COLUMN chunk_id VARCHAR(64) NOT NULL",
+            "ALTER TABLE document_chunks DROP INDEX idx_chunks_active_children",
+            *(
+                f"ALTER TABLE document_chunks ADD {kind} {name} ({', '.join(columns)})"
+                for name, (kind, columns) in _CHUNK_INDEXES.items()
+            ),
+            *(
+                f"ALTER TABLE document_chunks ADD CONSTRAINT {name} FOREIGN KEY ({', '.join(columns)}) "
+                f"REFERENCES {referenced_table} ({', '.join(referenced_columns)}) ON DELETE CASCADE"
+                for name, (columns, referenced_table, referenced_columns) in _CHUNK_FOREIGN_KEYS.items()
+            ),
+        }
+        if sql not in allowed:
+            raise ValueError("chunk schema migration is not allowed")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(sql)
+        except Exception as exc:
+            if not exc.args or exc.args[0] not in ignored_errnos:
+                raise
+        finally:
+            cur.close()
 
     def _ensure_column(self, table: str, column: str, ddl: str):
         if _COLUMN_MIGRATIONS.get((table, column)) != ddl:

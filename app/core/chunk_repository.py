@@ -137,8 +137,6 @@ class ChunkRepository:
                     """,
                     (version, index_version, document_id),
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError("document row count changed during transaction")
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -180,7 +178,10 @@ class ChunkRepository:
         with self._connection() as connection:
             return self._query_chunks(
                 connection,
-                "SELECT * FROM document_chunks WHERE task_id=%s ORDER BY position ASC",
+                """
+                SELECT * FROM document_chunks WHERE task_id=%s
+                ORDER BY position ASC, CASE WHEN chunk_type='parent' THEN 0 ELSE 1 END, row_id
+                """,
                 (task_id,),
             )
 

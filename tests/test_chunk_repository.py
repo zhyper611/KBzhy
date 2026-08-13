@@ -165,6 +165,11 @@ class MemoryCursor:
             for row in rows:
                 unique[row["doc_id"]] = {"doc_id": row["doc_id"], "document_version": row["document_version"]}
             return list(unique.values())
+        if "CASE WHEN chunk_type='parent' THEN 0 ELSE 1 END" in sql:
+            return sorted(
+                (deepcopy(r) for r in rows),
+                key=lambda r: (r.get("position", 0), 0 if r["chunk_type"] == "parent" else 1, r["row_id"]),
+            )
         return sorted((deepcopy(r) for r in rows), key=lambda r: r.get("position", 0))
 
     def fetchone(self):
@@ -192,6 +197,17 @@ def test_replace_staging_roundtrips_chunks_and_is_idempotent():
     assert repo.list_by_task("task-1") == chunks
     assert len(connection.rows) == 3
     assert connection.commits == 2
+
+
+def test_list_by_task_has_stable_parent_first_order_for_equal_positions():
+    connection = MemoryConnection()
+    repo = ChunkRepository(connection)
+    child = make_child("child-0", 0)
+    parent = make_parent(position=0)
+    repo.replace_staging("task-1", "doc-1", 1, [child, parent])
+
+    assert repo.list_by_task("task-1") == [parent, child]
+    assert "CASE WHEN chunk_type='parent' THEN 0 ELSE 1 END, row_id" in connection.sql[-1][0]
 
 
 def test_replace_staging_rolls_back_when_insert_fails():
@@ -394,20 +410,29 @@ def test_activate_version_rejects_mixed_index_versions():
     assert connection.rollbacks == 1
 
 
-@pytest.mark.parametrize("failure", ["activation", "document"])
-def test_activate_version_rolls_back_on_rowcount_mismatch(failure):
+def test_activate_version_rolls_back_on_activation_rowcount_mismatch():
     connection = MemoryConnection()
     repo = ChunkRepository(connection)
     repo.replace_staging("task", "doc-1", 2, [make_parent(version=2), make_child("child", 0, version=2)])
-    if failure == "activation":
-        connection.force_activation_rowcount = 0
-    else:
-        connection.force_document_rowcount = 0
+    connection.force_activation_rowcount = 0
 
     with pytest.raises(RuntimeError, match="row count"):
         repo.activate_version("doc-1", 2, "task")
 
     assert connection.rollbacks == 1
+
+
+def test_activate_version_accepts_zero_changed_rows_for_document_update():
+    connection = MemoryConnection()
+    connection.documents["doc-1"] = {"current_version": 2, "active_index_version": 3}
+    connection.force_document_rowcount = 0
+    repo = ChunkRepository(connection)
+    repo.replace_staging("task", "doc-1", 2, [make_parent(version=2), make_child("child", 0, version=2)])
+
+    repo.activate_version("doc-1", 2, "task")
+
+    assert connection.commits == 2
+    assert connection.rollbacks == 0
 
 
 def test_repository_created_from_store_uses_owned_connection_and_closes_it():
