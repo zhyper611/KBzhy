@@ -19,6 +19,9 @@ class FakeCursor:
     def fetchall(self):
         return list(self.rows)
 
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
     def close(self):
         self.closed = True
 
@@ -173,6 +176,9 @@ def test_ensure_schema_creates_version_and_chunk_tables_and_new_columns():
     assert "ADD COLUMN document_version INT NOT NULL DEFAULT 1" in sql
     assert "ADD COLUMN index_version INT NOT NULL DEFAULT 1" in sql
     assert "ADD COLUMN attempt_count INT NOT NULL DEFAULT 0" in sql
+    assert "ADD COLUMN filename VARCHAR(255) NULL" in sql
+    assert "ADD COLUMN file_type VARCHAR(32) NULL" in sql
+    assert "ADD COLUMN storage_path TEXT NULL" in sql
 
 
 def test_ensure_column_does_not_alter_existing_column():
@@ -689,6 +695,134 @@ def test_foreign_key_with_restrict_delete_rule_is_rejected():
 
     with pytest.raises(RuntimeError, match="foreign key shape"):
         store._ensure_document_chunks_shape()
+
+
+class DocumentTransactionConnection:
+    def __init__(self, *, max_version=1, fail_on=None):
+        self.max_version = max_version
+        self.fail_on = fail_on
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                connection.executed.append((normalized, params))
+                if connection.fail_on and connection.fail_on in normalized:
+                    raise RuntimeError("write failed")
+                if normalized.startswith("SELECT doc_id"):
+                    self.row = {"doc_id": "doc1", "current_version": 1, "content_hash": "active-hash"}
+                elif normalized.startswith("SELECT COALESCE(MAX(version)"):
+                    self.row = {"max_version": connection.max_version}
+                else:
+                    self.row = None
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+def test_create_document_version_and_task_locks_document_and_uses_max_version():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = DocumentTransactionConnection(max_version=4)
+
+    version = store.create_document_version_and_task(
+        "doc1", "kb1", "new-hash", "/uploads/kb1/doc1/task2/new.txt",
+        "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
+    )
+
+    assert version == 5
+    sql = [statement for statement, _ in store._conn.executed]
+    assert any(statement.endswith("FOR UPDATE") for statement in sql)
+    assert any("SELECT COALESCE(MAX(version), 0) AS max_version" in statement for statement in sql)
+    version_insert = next((statement, params) for statement, params in store._conn.executed if statement.startswith("INSERT INTO document_versions"))
+    assert version_insert[1][2] == 5
+    assert version_insert[1][3] == "new-hash"
+    task_insert = next((statement, params) for statement, params in store._conn.executed if statement.startswith("INSERT INTO document_index_tasks"))
+    assert task_insert[1][-3:-1] == (5, 1)
+    document_update = next(statement for statement in sql if statement.startswith("UPDATE documents"))
+    assert "current_version" not in document_update
+    assert "content_hash" not in document_update
+    assert store._conn.commits == 1
+    assert store._conn.rollbacks == 0
+
+
+def test_create_document_version_and_task_rolls_back_all_writes():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = DocumentTransactionConnection(fail_on="INSERT INTO document_index_tasks")
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        store.create_document_version_and_task(
+            "doc1", "kb1", "new-hash", "/uploads/new.txt",
+            "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
+        )
+
+    assert store._conn.commits == 0
+    assert store._conn.rollbacks == 1
+
+
+def test_create_document_with_task_creates_v1_staging_and_versioned_task():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = DocumentTransactionConnection(max_version=0)
+    document = {
+        "id": "doc-new", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
+        "status": "queued", "chunk_count": 0, "task_id": "task1", "storage_path": "/uploads/v1/guide.txt",
+        "content_hash": "hash-v1", "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }
+    task = {
+        "task_id": "task1", "doc_id": "doc-new", "kb_id": "kb1", "status": "queued",
+        "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }
+
+    store.create_document_with_task(document, task)
+
+    statements = store._conn.executed
+    document_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO documents"))
+    assert document_insert[1][9:12] == (None, 0, 0)
+    version_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO document_versions"))
+    assert version_insert[1][1:5] == ("doc-new", 1, "hash-v1", "guide.txt")
+    assert version_insert[1][-2] == "staging"
+    task_insert = next((sql, params) for sql, params in statements if sql.startswith("INSERT INTO document_index_tasks"))
+    assert task_insert[1][-3:-1] == (1, 1)
+
+
+def test_find_document_by_hash_matches_active_or_staging_hash_and_excludes_deleting():
+    store = object.__new__(MySQLMetadataStore)
+    cursor = FakeCursor(rows=[{
+        "doc_id": "doc1", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 2, "task_id": "task1", "storage_path": "/guide.txt",
+        "content_hash": "same-hash", "current_version": 1, "active_index_version": 1,
+        "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }])
+    captured = {}
+
+    def execute(sql, params=()):
+        captured["sql"] = " ".join(sql.split())
+        captured["params"] = params
+        return cursor
+
+    store._execute = execute
+
+    result = store.find_document_by_hash("kb1", "same-hash")
+
+    assert result["id"] == "doc1"
+    assert "d.status<>'deleting'" in captured["sql"]
+    assert "dv.status='staging'" in captured["sql"]
+    assert captured["params"] == ("kb1", "same-hash", "same-hash")
 
 
 def test_duplicate_foreign_key_errno_rechecks_delete_rule():

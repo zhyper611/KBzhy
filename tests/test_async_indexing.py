@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 from KBzhy.app.api import documents
 from KBzhy.app.core.indexing_worker import IndexingWorker
@@ -30,6 +33,7 @@ class InMemoryStore:
         }
         self.documents = {}
         self.tasks = {}
+        self.versions = {}
 
     def knowledge_base_exists(self, kb_id):
         return kb_id in self.kbs
@@ -43,6 +47,59 @@ class InMemoryStore:
     def create_document_with_task(self, document, task):
         self.create_document(document)
         self.create_task(task)
+        self.documents[document["id"]].update(content_hash=None, current_version=0, active_index_version=0)
+        self.versions[(document["id"], 1)] = {
+            "content_hash": document["content_hash"],
+            "storage_path": document["storage_path"],
+            "status": "staging",
+        }
+        self.tasks[task["task_id"]].update(document_version=1, index_version=1)
+
+    def find_document_by_hash(self, kb_id, content_hash, exclude_document_id=None):
+        for document in self.documents.values():
+            if document["kb_id"] != kb_id or document.get("status") == "deleting":
+                continue
+            if document["id"] == exclude_document_id:
+                continue
+            if document.get("content_hash") == content_hash:
+                return dict(document)
+            if any(
+                version["content_hash"] == content_hash and version["status"] == "staging"
+                for (version_doc_id, _), version in self.versions.items()
+                if version_doc_id == document["id"]
+            ):
+                return dict(document)
+        return None
+
+    def create_document_version_and_task(
+        self, document_id, kb_id, content_hash, storage_path, filename, file_type, task_id, now
+    ):
+        document = self.documents[document_id]
+        version = max((v for doc_id, v in self.versions if doc_id == document_id), default=0) + 1
+        self.versions[(document_id, version)] = {
+            "content_hash": content_hash,
+            "storage_path": storage_path,
+            "status": "staging",
+        }
+        document.update(
+            filename=filename,
+            file_type=file_type,
+            status="queued",
+            chunk_count=0,
+            task_id=task_id,
+            storage_path=storage_path,
+            error_message=None,
+            updated_at=now,
+        )
+        self.tasks[task_id] = {
+            "task_id": task_id,
+            "doc_id": document_id,
+            "kb_id": kb_id,
+            "status": "queued",
+            "document_version": version,
+            "index_version": 1,
+        }
+        return version
 
     def update_document(self, doc_id, **changes):
         self.documents[doc_id].update(changes)
@@ -89,6 +146,138 @@ def test_upload_document_queues_indexing_without_calling_engine(monkeypatch, tmp
     saved_path = Path(store.documents[response.id]["storage_path"])
     assert saved_path.exists()
     assert saved_path.read_bytes() == b"hello"
+    assert store.documents[response.id]["content_hash"] is None
+    assert store.documents[response.id]["current_version"] == 0
+    assert store.versions[(response.id, 1)]["status"] == "staging"
+    assert store.versions[(response.id, 1)]["content_hash"] == hashlib.sha256(b"hello").hexdigest()
+    assert store.tasks[response.task_id]["document_version"] == 1
+    assert store.tasks[response.task_id]["index_version"] == 1
+
+
+def test_upload_duplicate_returns_structured_409_without_writing_or_enqueueing(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    content = b"same bytes"
+    store.documents["existing"] = {
+        "id": "existing",
+        "kb_id": "kb1",
+        "filename": "existing.txt",
+        "status": "ready",
+        "content_hash": hashlib.sha256(content).hexdigest(),
+    }
+    queued = []
+
+    class Worker:
+        def enqueue(self, task_id):
+            queued.append(task_id)
+
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_indexing_worker", lambda: Worker())
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(documents.HTTPException) as exc_info:
+        asyncio.run(documents.upload_document("kb1", FakeUploadFile("copy.txt", content)))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["document_id"] == "existing"
+    assert exc_info.value.detail["message"]
+    assert queued == []
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_update_unchanged_document_is_noop(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    content = b"unchanged"
+    old_path = tmp_path / "kb1" / "doc1" / "v1" / "old.txt"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(content)
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 3, "task_id": "old-task", "storage_path": str(old_path),
+        "content_hash": hashlib.sha256(content).hexdigest(), "current_version": 1,
+    }
+    queued = []
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_indexing_worker", lambda: type("Worker", (), {"enqueue": lambda _, task: queued.append(task)})())
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(documents, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("engine should not run")))
+
+    response = asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("renamed.txt", content)))
+
+    assert response.message == "文档内容未变化，无需重新索引"
+    assert response.filename == "old.txt"
+    assert response.status.value == "ready"
+    assert queued == []
+    assert old_path.exists()
+    assert len(store.tasks) == 0
+
+
+def test_update_rejects_hash_owned_by_another_document(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    content = b"duplicate"
+    store.documents["doc1"] = {"id": "doc1", "kb_id": "kb1", "filename": "one.txt", "status": "ready"}
+    store.documents["doc2"] = {
+        "id": "doc2", "kb_id": "kb1", "filename": "two.txt", "status": "ready",
+        "content_hash": hashlib.sha256(content).hexdigest(),
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(documents.HTTPException) as exc_info:
+        asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("one.txt", content)))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["document_id"] == "doc2"
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_update_prioritizes_other_duplicate_over_self_noop(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    content_hash = hashlib.sha256(b"same").hexdigest()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "one.txt", "file_type": ".txt",
+        "status": "ready", "content_hash": content_hash,
+    }
+    store.documents["doc2"] = {
+        "id": "doc2", "kb_id": "kb1", "filename": "two.txt", "status": "ready",
+        "content_hash": content_hash,
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(documents.HTTPException) as exc_info:
+        asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("one.txt", b"same")))
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["document_id"] == "doc2"
+
+
+def test_changed_update_preserves_active_file_and_index_and_creates_staging_version(monkeypatch, tmp_path):
+    store = InMemoryStore()
+    old_path = tmp_path / "kb1" / "doc1" / "v1" / "old.txt"
+    old_path.parent.mkdir(parents=True)
+    old_path.write_bytes(b"old")
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 2, "task_id": "task1", "storage_path": str(old_path),
+        "content_hash": hashlib.sha256(b"old").hexdigest(), "current_version": 1,
+    }
+    store.versions[("doc1", 1)] = {"content_hash": hashlib.sha256(b"old").hexdigest(), "storage_path": str(old_path), "status": "active"}
+    queued = []
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "get_indexing_worker", lambda: type("Worker", (), {"enqueue": lambda _, task: queued.append(task)})())
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(documents, "get_engine", lambda: (_ for _ in ()).throw(AssertionError("old index must remain")))
+
+    response = asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("new.txt", b"new")))
+
+    assert old_path.read_bytes() == b"old"
+    assert store.documents["doc1"]["current_version"] == 1
+    assert store.documents["doc1"]["content_hash"] == hashlib.sha256(b"old").hexdigest()
+    staging = store.versions[("doc1", 2)]
+    assert Path(staging["storage_path"]).read_bytes() == b"new"
+    assert response.task_id in staging["storage_path"]
+    assert store.tasks[response.task_id]["document_version"] == 2
+    assert queued == [response.task_id]
 
 
 def test_indexing_worker_rolls_back_vectors_and_marks_failed(tmp_path):

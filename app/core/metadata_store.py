@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +29,9 @@ _COLUMN_MIGRATIONS = {
     ("document_index_tasks", "document_version"): "INT NOT NULL DEFAULT 1",
     ("document_index_tasks", "index_version"): "INT NOT NULL DEFAULT 1",
     ("document_index_tasks", "attempt_count"): "INT NOT NULL DEFAULT 0",
+    ("document_versions", "filename"): "VARCHAR(255) NULL",
+    ("document_versions", "file_type"): "VARCHAR(32) NULL",
+    ("document_versions", "storage_path"): "TEXT NULL",
 }
 
 _CHUNK_INDEXES = {
@@ -165,6 +169,9 @@ class MySQLMetadataStore:
                 doc_id VARCHAR(128) NOT NULL,
                 version INT NOT NULL,
                 content_hash VARCHAR(64) NULL,
+                filename VARCHAR(255) NULL,
+                file_type VARCHAR(32) NULL,
+                storage_path TEXT NULL,
                 parser_version VARCHAR(64) NULL,
                 parsed_artifact_path TEXT NULL,
                 status VARCHAR(32) NOT NULL,
@@ -571,6 +578,9 @@ class MySQLMetadataStore:
             "task_id": row.get("task_id"),
             "storage_path": row.get("storage_path"),
             "error_message": row.get("error_message"),
+            "content_hash": row.get("content_hash"),
+            "current_version": int(row.get("current_version") or 0),
+            "active_index_version": int(row.get("active_index_version") or 0),
             "created_at": cls._dt(row["created_at"]),
             "updated_at": cls._dt(row["updated_at"]),
         }
@@ -585,6 +595,8 @@ class MySQLMetadataStore:
             "kb_id": row["kb_id"],
             "status": row["status"],
             "error_message": row.get("error_message"),
+            "document_version": int(row.get("document_version") or 1),
+            "index_version": int(row.get("index_version") or 1),
             "created_at": cls._dt(row["created_at"]),
             "updated_at": cls._dt(row["updated_at"]),
         }
@@ -659,13 +671,15 @@ class MySQLMetadataStore:
         self._conn.commit()
 
     def create_document_with_task(self, document: dict, task: dict):
+        cur = self._conn.cursor()
         try:
-            cur = self._conn.cursor()
             cur.execute(
                 """
                 INSERT INTO documents
-                    (doc_id, kb_id, filename, file_type, status, chunk_count, task_id, storage_path, error_message, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (doc_id, kb_id, filename, file_type, status, chunk_count, task_id,
+                     storage_path, error_message, content_hash, current_version,
+                     active_index_version, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     document["id"],
@@ -677,15 +691,40 @@ class MySQLMetadataStore:
                     document.get("task_id"),
                     document.get("storage_path"),
                     document.get("error_message"),
+                    None,
+                    0,
+                    0,
                     self._mysql_dt(document["created_at"]),
                     self._mysql_dt(document["updated_at"]),
                 ),
             )
             cur.execute(
                 """
+                INSERT INTO document_versions
+                    (version_id, doc_id, version, content_hash, filename, file_type,
+                     storage_path, parser_version, parsed_artifact_path, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    document["id"],
+                    1,
+                    document["content_hash"],
+                    document["filename"],
+                    document.get("file_type") or "",
+                    document.get("storage_path"),
+                    None,
+                    None,
+                    "staging",
+                    self._mysql_dt(document["created_at"]),
+                ),
+            )
+            cur.execute(
+                """
                 INSERT INTO document_index_tasks
-                    (task_id, doc_id, kb_id, status, error_message, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (task_id, doc_id, kb_id, status, error_message, created_at, updated_at,
+                     document_version, index_version, attempt_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     task["task_id"],
@@ -695,13 +734,123 @@ class MySQLMetadataStore:
                     task.get("error_message"),
                     self._mysql_dt(task["created_at"]),
                     self._mysql_dt(task["updated_at"]),
+                    1,
+                    task.get("index_version", 1),
+                    task.get("attempt_count", 0),
                 ),
             )
-            cur.close()
             self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
+        finally:
+            cur.close()
+
+    def find_document_by_hash(
+        self,
+        kb_id: str,
+        content_hash: str,
+        exclude_document_id: str | None = None,
+    ) -> dict | None:
+        exclusion_sql = " AND d.doc_id<>%s" if exclude_document_id else ""
+        params = [kb_id]
+        if exclude_document_id:
+            params.append(exclude_document_id)
+        params.extend((content_hash, content_hash))
+        cur = self._execute(
+            f"""
+            SELECT d.*
+            FROM documents d
+            WHERE d.kb_id=%s
+              {exclusion_sql}
+              AND d.status<>'deleting'
+              AND (
+                  d.content_hash=%s
+                  OR EXISTS (
+                      SELECT 1 FROM document_versions dv
+                      WHERE dv.doc_id=d.doc_id
+                        AND dv.content_hash=%s
+                        AND dv.status='staging'
+                  )
+              )
+            LIMIT 1
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return self._doc_from_row(row)
+
+    def create_document_version_and_task(
+        self,
+        document_id: str,
+        kb_id: str,
+        content_hash: str,
+        storage_path: str,
+        filename: str,
+        file_type: str,
+        task_id: str,
+        now: str,
+    ) -> int:
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "SELECT doc_id, current_version, content_hash FROM documents "
+                "WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (document_id, kb_id),
+            )
+            if not cur.fetchone():
+                raise ValueError("document does not exist")
+            cur.execute(
+                "SELECT COALESCE(MAX(version), 0) AS max_version "
+                "FROM document_versions WHERE doc_id=%s",
+                (document_id,),
+            )
+            new_version = int((cur.fetchone() or {}).get("max_version") or 0) + 1
+            cur.execute(
+                """
+                INSERT INTO document_versions
+                    (version_id, doc_id, version, content_hash, filename, file_type,
+                     storage_path, parser_version, parsed_artifact_path, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    uuid.uuid4().hex, document_id, new_version, content_hash,
+                    filename, file_type, storage_path, None, None, "staging",
+                    self._mysql_dt(now),
+                ),
+            )
+            cur.execute(
+                """
+                UPDATE documents
+                SET filename=%s, file_type=%s, status=%s, chunk_count=%s,
+                    task_id=%s, storage_path=%s, error_message=%s, updated_at=%s
+                WHERE doc_id=%s AND kb_id=%s
+                """,
+                (
+                    filename, file_type, "queued", 0, task_id, storage_path,
+                    None, self._mysql_dt(now), document_id, kb_id,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO document_index_tasks
+                    (task_id, doc_id, kb_id, status, error_message, created_at, updated_at,
+                     document_version, index_version, attempt_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    task_id, document_id, kb_id, "queued", None,
+                    self._mysql_dt(now), self._mysql_dt(now), new_version, 1, 0,
+                ),
+            )
+            self._conn.commit()
+            return new_version
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     def update_document(self, doc_id: str, **changes):
         if not changes:

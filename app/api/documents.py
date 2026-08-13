@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -60,8 +61,14 @@ def _safe_filename(filename: str) -> str:
     return Path(filename).name.replace("\x00", "")
 
 
-def _save_upload_file(kb_id: str, doc_id: str, filename: str, content: bytes) -> str:
-    base_dir = Path(UPLOAD_STORAGE_DIR) / kb_id / doc_id
+def _save_upload_file(
+    kb_id: str,
+    doc_id: str,
+    filename: str,
+    content: bytes,
+    version_directory: str = "v1",
+) -> str:
+    base_dir = Path(UPLOAD_STORAGE_DIR) / kb_id / doc_id / version_directory
     base_dir.mkdir(parents=True, exist_ok=True)
     target = base_dir / _safe_filename(filename)
     target.write_bytes(content)
@@ -139,6 +146,7 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="文件名不能为空")
 
     content = await file.read()
+    content_hash = hashlib.sha256(content).hexdigest()
     if not content:
         raise HTTPException(status_code=400, detail="文件内容为空")
     if len(content) > MAX_UPLOAD_SIZE:
@@ -147,6 +155,12 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
     store = _store()
     if not store.knowledge_base_exists(kb_id):
         raise HTTPException(status_code=404, detail="知识库不存在")
+    duplicate = store.find_document_by_hash(kb_id, content_hash)
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "知识库中已存在相同内容的文档", "document_id": duplicate["id"]},
+        )
 
     doc_id = uuid.uuid4().hex
     task_id = uuid.uuid4().hex
@@ -165,6 +179,7 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
             "chunk_count": 0,
             "task_id": task_id,
             "storage_path": storage_path,
+            "content_hash": content_hash,
             "error_message": None,
             "created_at": now,
             "updated_at": now,
@@ -195,50 +210,57 @@ async def upload_document(kb_id: str, file: UploadFile = File(...)):
 
 @router.put("/knowledge-bases/{kb_id}/documents/{doc_id}", response_model=DocumentUpdateResponse)
 async def update_document(kb_id: str, doc_id: str, file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
     store = _store()
     current = store.get_document(kb_id, doc_id)
     if not current:
         raise HTTPException(status_code=404, detail="文档不存在")
 
     content = await file.read()
+    content_hash = hashlib.sha256(content).hexdigest()
     if not content:
         raise HTTPException(status_code=400, detail="文件内容为空")
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail=f"文件大小超过限制 ({MAX_UPLOAD_SIZE // 1024 // 1024}MB)")
 
-    engine = get_engine()
+    duplicate = store.find_document_by_hash(kb_id, content_hash, exclude_document_id=doc_id)
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "知识库中已存在相同内容的文档", "document_id": duplicate["id"]},
+        )
+    duplicate = store.find_document_by_hash(kb_id, content_hash)
+    if duplicate:
+        return DocumentUpdateResponse(
+            id=doc_id,
+            filename=current["filename"],
+            kb_id=kb_id,
+            status=DocStatus(current["status"]),
+            chunk_count=current.get("chunk_count", 0),
+            task_id=current.get("task_id"),
+            error_message=current.get("error_message"),
+            message="文档内容未变化，无需重新索引",
+        )
+
     task_id = uuid.uuid4().hex
     filename = _safe_filename(file.filename)
     ext = os.path.splitext(filename)[1].lower()
     now = now_iso()
 
     try:
-        engine.remove_document(current["filename"], kb_id, doc_id=doc_id)
-        shutil.rmtree(Path(UPLOAD_STORAGE_DIR) / kb_id / doc_id, ignore_errors=True)
-        storage_path = _save_upload_file(kb_id, doc_id, filename, content)
-        store.update_document(
-            doc_id,
-            filename=filename,
-            file_type=ext,
-            status=DocStatus.QUEUED.value,
-            chunk_count=0,
-            task_id=task_id,
-            storage_path=storage_path,
-            error_message=None,
-            updated_at=now,
+        storage_path = _save_upload_file(kb_id, doc_id, filename, content, task_id)
+        store.create_document_version_and_task(
+            doc_id, kb_id, content_hash, storage_path, filename, ext, task_id, now
         )
-        store.create_task({
-            "task_id": task_id,
-            "doc_id": doc_id,
-            "kb_id": kb_id,
-            "status": "queued",
-            "error_message": None,
-            "created_at": now,
-            "updated_at": now,
-        })
+    except Exception as exc:
+        shutil.rmtree(Path(UPLOAD_STORAGE_DIR) / kb_id / doc_id / task_id, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"文档更新入队失败: {exc}") from exc
+
+    try:
         get_indexing_worker().enqueue(task_id)
     except Exception as exc:
-        store.update_document(doc_id, status=DocStatus.FAILED.value, error_message=str(exc))
         raise HTTPException(status_code=500, detail=f"文档更新入队失败: {exc}") from exc
 
     return DocumentUpdateResponse(

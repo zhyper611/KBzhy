@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 from fastapi import HTTPException
@@ -38,6 +39,17 @@ class FakeStore:
             return dict(doc)
         return None
 
+    def find_document_by_hash(self, kb_id, content_hash, exclude_document_id=None):
+        for doc in self.documents.values():
+            if (
+                doc["kb_id"] == kb_id
+                and doc["id"] != exclude_document_id
+                and doc.get("content_hash") == content_hash
+                and doc.get("status") != "deleting"
+            ):
+                return dict(doc)
+        return None
+
 
 def test_upload_rejects_unknown_knowledge_base(monkeypatch):
     store = FakeStore()
@@ -59,6 +71,44 @@ def test_upload_rejects_empty_file(monkeypatch):
         asyncio.run(documents.upload_document("kb1", FakeUploadFile("empty.txt", b"")))
 
     assert exc.value.status_code == 400
+
+
+def test_upload_duplicate_error_identifies_existing_document(monkeypatch, tmp_path):
+    store = FakeStore()
+    content = b"duplicate content"
+    store.kbs["kb1"] = {"kb_id": "kb1"}
+    store.documents["doc-existing"] = {
+        "id": "doc-existing", "kb_id": "kb1", "filename": "original.txt",
+        "status": "ready", "content_hash": hashlib.sha256(content).hexdigest(),
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(documents.upload_document("kb1", FakeUploadFile("copy.txt", content)))
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == {
+        "message": "知识库中已存在相同内容的文档",
+        "document_id": "doc-existing",
+    }
+    assert not tmp_path.exists() or not list(tmp_path.iterdir())
+
+
+def test_update_rejects_empty_filename_before_writing(monkeypatch, tmp_path):
+    store = FakeStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 1,
+    }
+    monkeypatch.setattr(documents, "get_metadata_store", lambda: store)
+    monkeypatch.setattr(documents, "UPLOAD_STORAGE_DIR", str(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(documents.update_document("kb1", "doc1", FakeUploadFile("", b"new")))
+
+    assert exc.value.status_code == 400
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_get_document_chunks_returns_chunks_for_ready_document(monkeypatch):
