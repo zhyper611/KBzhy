@@ -111,6 +111,10 @@ class RAGEngine:
         except httpx.ResponseNotRead:
             return "<streaming response body not read>"
 
+    @staticmethod
+    def _is_refusal_answer(answer: str) -> bool:
+        return KNOWLEDGE_QA_REFUSAL in answer
+
     def _call_llm_stream(
         self,
         messages: list[dict[str, str]],
@@ -309,7 +313,7 @@ class RAGEngine:
             with timed_stage(logger, "llm_generate_sync", request_id=request_id, model=self.llm_model):
                 answer = self._call_llm_sync(messages, temp)
 
-        sources = [
+        sources = [] if self._is_refusal_answer(answer) else [
             {
                 "content": r["content"],
                 "source": r.get("metadata", {}).get("source", ""),
@@ -322,7 +326,7 @@ class RAGEngine:
             memory.add_message("user", question)
             memory.add_message("assistant", answer, sources=sources)
 
-        flags = self._detect_hallucinations(answer, results)
+        flags = [] if self._is_refusal_answer(answer) else self._detect_hallucinations(answer, results)
 
         return {
             "answer": answer,
@@ -405,7 +409,7 @@ class RAGEngine:
                     full.append(chunk)
                     yield chunk
             full_text = "".join(full)
-            sources = [
+            sources = [] if self._is_refusal_answer(full_text) else [
                 {
                     "content": r["content"],
                     "source": r.get("metadata", {}).get("source", ""),

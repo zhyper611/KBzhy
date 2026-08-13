@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from contextlib import nullcontext
 from fastapi import HTTPException
 
 from KBzhy.app.api import chat
@@ -36,6 +37,17 @@ class EmptyRetriever:
         return []
 
 
+class FixedRetriever:
+    def retrieve(self, *args, **kwargs):
+        return [
+            {
+                "content": "irrelevant retrieved content",
+                "metadata": {"source": "education.md", "page": 1},
+                "score": 0.9,
+            }
+        ]
+
+
 def test_chat_records_refusal_in_session_memory():
     memory = FakeMemory()
     engine = RAGEngine.__new__(RAGEngine)
@@ -55,6 +67,36 @@ def test_chat_records_refusal_in_session_memory():
         {"role": "user", "content": "未知问题"},
         {"role": "assistant", "content": KNOWLEDGE_QA_REFUSAL, "sources": []},
     ]
+
+
+def test_chat_clears_sources_when_llm_refuses_after_retrieval():
+    memory = FakeMemory()
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.memory_manager = FakeMemoryManager(memory)
+    engine.retriever = FixedRetriever()
+    engine.llm_model = "test-model"
+    engine._call_llm_sync = lambda *args, **kwargs: f"{KNOWLEDGE_QA_REFUSAL} 建议补充对应文档。"
+    engine._manage_context_window = lambda messages: nullcontext()
+
+    result = engine.chat(question="out of scope question", kb_id="kb1", session_id="s1")
+
+    assert result["sources"] == []
+    assert memory.messages[-1]["sources"] == []
+
+
+def test_chat_stream_clears_sources_when_llm_refuses_after_retrieval():
+    memory = FakeMemory()
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.memory_manager = FakeMemoryManager(memory)
+    engine.retriever = FixedRetriever()
+    engine.llm_model = "test-model"
+    engine._call_llm_stream = lambda *args, **kwargs: iter([KNOWLEDGE_QA_REFUSAL, " 建议补充对应文档。"])
+    engine._manage_context_window = lambda messages: nullcontext()
+
+    chunks = list(engine.chat_stream(question="out of scope question", kb_id="kb1", session_id="s1"))
+
+    assert chunks[-1] == "[SOURCES][]"
+    assert memory.messages[-1]["sources"] == []
 
 
 def test_build_messages_uses_strict_knowledge_qa_prompt():
