@@ -41,6 +41,7 @@ _CHUNK_FOREIGN_KEYS = {
         ("doc_id", "document_version"),
         "document_versions",
         ("doc_id", "version"),
+        "CASCADE",
     ),
 }
 
@@ -276,9 +277,9 @@ class MySQLMetadataStore:
             ):
                 raise RuntimeError(f"document_chunks index shape did not match after migration: {name}")
 
-        for name, (columns, referenced_table, referenced_columns) in _CHUNK_FOREIGN_KEYS.items():
+        for name, (columns, referenced_table, referenced_columns, delete_rule) in _CHUNK_FOREIGN_KEYS.items():
             existing = self._get_foreign_key("document_chunks", name)
-            expected = (columns, referenced_table, referenced_columns)
+            expected = (columns, referenced_table, referenced_columns, delete_rule)
             if existing == expected:
                 continue
             if existing:
@@ -288,7 +289,7 @@ class MySQLMetadataStore:
             referenced_sql = ", ".join(referenced_columns)
             self._execute_chunk_ddl(
                 f"ALTER TABLE document_chunks ADD CONSTRAINT {name} "
-                f"FOREIGN KEY ({column_sql}) REFERENCES {referenced_table} ({referenced_sql}) ON DELETE CASCADE",
+                f"FOREIGN KEY ({column_sql}) REFERENCES {referenced_table} ({referenced_sql}) ON DELETE {delete_rule}",
                 {1826},
             )
             if self._get_foreign_key("document_chunks", name) != expected:
@@ -307,16 +308,16 @@ class MySQLMetadataStore:
         try:
             cur.execute(
                 """
-                INSERT INTO document_versions
+                INSERT IGNORE INTO document_versions
                     (version_id, doc_id, version, content_hash, parser_version,
                      parsed_artifact_path, status, created_at)
                 SELECT
                     SHA2(CONCAT('legacy:', dc.doc_id, ':', dc.document_version), 256),
                     dc.doc_id,
                     dc.document_version,
-                    d.content_hash,
-                    d.parser_version,
-                    d.parsed_artifact_path,
+                    CASE WHEN d.current_version=dc.document_version THEN d.content_hash ELSE NULL END,
+                    CASE WHEN d.current_version=dc.document_version THEN d.parser_version ELSE NULL END,
+                    CASE WHEN d.current_version=dc.document_version THEN d.parsed_artifact_path ELSE NULL END,
                     CASE WHEN d.current_version=dc.document_version THEN 'active' ELSE 'inactive' END,
                     COALESCE(d.created_at, NOW(3))
                 FROM (
@@ -433,6 +434,14 @@ class MySQLMetadataStore:
                 (table, name),
             )
             rows = cur.fetchall()
+            cur.execute(
+                """
+                SELECT DELETE_RULE FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS
+                WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=%s AND CONSTRAINT_NAME=%s
+                """,
+                (table, name),
+            )
+            referential = cur.fetchone()
         finally:
             cur.close()
         if not rows:
@@ -441,6 +450,7 @@ class MySQLMetadataStore:
             tuple(row["COLUMN_NAME"] for row in rows),
             rows[0]["REFERENCED_TABLE_NAME"],
             tuple(row["REFERENCED_COLUMN_NAME"] for row in rows),
+            (referential or {}).get("DELETE_RULE"),
         )
 
     def _execute_chunk_ddl(self, sql: str, ignored_errnos: set[int]):
@@ -455,8 +465,8 @@ class MySQLMetadataStore:
             ),
             *(
                 f"ALTER TABLE document_chunks ADD CONSTRAINT {name} FOREIGN KEY ({', '.join(columns)}) "
-                f"REFERENCES {referenced_table} ({', '.join(referenced_columns)}) ON DELETE CASCADE"
-                for name, (columns, referenced_table, referenced_columns) in _CHUNK_FOREIGN_KEYS.items()
+                f"REFERENCES {referenced_table} ({', '.join(referenced_columns)}) ON DELETE {delete_rule}"
+                for name, (columns, referenced_table, referenced_columns, delete_rule) in _CHUNK_FOREIGN_KEYS.items()
             ),
         }
         if sql not in allowed:

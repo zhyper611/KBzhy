@@ -104,6 +104,8 @@ class SchemaConnection:
                     self._row = self._rows[0] if self._rows else None
                 elif "INFORMATION_SCHEMA.TABLE_CONSTRAINTS" in normalized:
                     self._row = {"CONSTRAINT_TYPE": "FOREIGN KEY"}
+                elif "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in normalized:
+                    self._row = {"DELETE_RULE": "CASCADE"}
                 elif "INFORMATION_SCHEMA.KEY_COLUMN_USAGE" in normalized:
                     self._rows = [
                         {"COLUMN_NAME": "doc_id", "REFERENCED_TABLE_NAME": "document_versions", "REFERENCED_COLUMN_NAME": "doc_id"},
@@ -262,15 +264,26 @@ class ChunkShapeConnection:
                 ("doc_id", "document_version"),
                 "document_versions",
                 ("doc_id", "version"),
+                "CASCADE",
             )
         self.executed = []
         self.alter_errors = {}
         self.alter_races = {}
         self.chunk_versions = {("doc-legacy", 7)} if not current else set()
+        self.documents = {
+            "doc-legacy": {
+                "current_version": 7,
+                "content_hash": "current-hash",
+                "parser_version": "parser-v2",
+                "parsed_artifact_path": "/parsed/current.json",
+            }
+        }
         self.document_versions = set()
         self.version_rows = []
         self.commits = 0
         self.events = []
+        self.ignore_insert = False
+        self.concurrent_duplicate_1062 = False
 
     def cursor(self):
         return ChunkShapeCursor(self)
@@ -309,10 +322,14 @@ class ChunkShapeCursor:
                 if params[1] in self.connection.foreign_keys
                 else []
             )
+        elif "INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS" in normalized:
+            foreign_key = self.connection.foreign_keys.get(params[1])
+            delete_rule = foreign_key[3] if foreign_key and len(foreign_key) > 3 else "CASCADE"
+            self.rows = [{"DELETE_RULE": delete_rule}] if foreign_key else []
         elif "INFORMATION_SCHEMA.KEY_COLUMN_USAGE" in normalized:
             foreign_key = self.connection.foreign_keys.get(params[1])
             if foreign_key:
-                local, referenced_table, remote = foreign_key
+                local, referenced_table, remote = foreign_key[:3]
                 self.rows = [
                     {
                         "COLUMN_NAME": local_name,
@@ -323,12 +340,29 @@ class ChunkShapeCursor:
                 ]
             else:
                 self.rows = []
-        elif normalized.startswith("INSERT INTO document_versions"):
+        elif normalized.startswith("INSERT IGNORE INTO document_versions"):
+            if self.connection.concurrent_duplicate_1062:
+                self.connection.document_versions.update(self.connection.chunk_versions)
+                self.rows = []
+                return
+            if self.connection.ignore_insert:
+                self.rows = []
+                return
             for doc_id, version in sorted(self.connection.chunk_versions - self.connection.document_versions):
                 version_id = hashlib.sha256(f"legacy:{doc_id}:{version}".encode()).hexdigest()
+                document = self.connection.documents[doc_id]
+                is_current = document["current_version"] == version
                 self.connection.document_versions.add((doc_id, version))
                 self.connection.version_rows.append(
-                    {"version_id": version_id, "doc_id": doc_id, "version": version}
+                    {
+                        "version_id": version_id,
+                        "doc_id": doc_id,
+                        "version": version,
+                        "content_hash": document["content_hash"] if is_current else None,
+                        "parser_version": document["parser_version"] if is_current else None,
+                        "parsed_artifact_path": document["parsed_artifact_path"] if is_current else None,
+                        "status": "active" if is_current else "inactive",
+                    }
                 )
             self.rows = []
         elif "COUNT(*) AS missing_count" in normalized:
@@ -368,6 +402,7 @@ class ChunkShapeCursor:
                 ("doc_id", "document_version"),
                 "document_versions",
                 ("doc_id", "version"),
+                "CASCADE",
             )
 
     def fetchone(self):
@@ -395,6 +430,7 @@ def test_document_chunks_shape_migrates_legacy_primary_key_and_objects():
         ("doc_id", "document_version"),
         "document_versions",
         ("doc_id", "version"),
+        "CASCADE",
     )
     assert store._conn.document_versions == {("doc-legacy", 7)}
     assert len(store._conn.version_rows[0]["version_id"]) == 64
@@ -465,6 +501,48 @@ def test_document_version_backfill_is_idempotent():
 
     assert store._conn.version_rows == first_rows
     assert store._conn.commits == 2
+
+
+def test_document_version_backfill_only_copies_metadata_to_current_version():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.chunk_versions = {("doc-legacy", 1), ("doc-legacy", 2)}
+    store._conn.documents["doc-legacy"]["current_version"] = 2
+
+    store._backfill_missing_document_versions()
+
+    by_version = {row["version"]: row for row in store._conn.version_rows}
+    assert by_version[1]["status"] == "inactive"
+    assert by_version[1]["content_hash"] is None
+    assert by_version[1]["parser_version"] is None
+    assert by_version[1]["parsed_artifact_path"] is None
+    assert by_version[2]["status"] == "active"
+    assert by_version[2]["content_hash"] == "current-hash"
+    assert by_version[2]["parser_version"] == "parser-v2"
+    assert by_version[2]["parsed_artifact_path"] == "/parsed/current.json"
+    insert_sql = next(sql for sql, _ in store._conn.executed if sql.startswith("INSERT"))
+    assert insert_sql.startswith("INSERT IGNORE INTO document_versions")
+    assert "CASE WHEN d.current_version=dc.document_version THEN d.content_hash ELSE NULL END" in insert_sql
+
+
+def test_document_version_backfill_rejects_unresolved_insert_ignore_rows():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection()
+    store._conn.ignore_insert = True
+
+    with pytest.raises(RuntimeError, match="unresolved"):
+        store._backfill_missing_document_versions()
+
+
+def test_document_version_backfill_accepts_concurrent_1062_unique_race_after_recheck():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection()
+    store._conn.concurrent_duplicate_1062 = True
+
+    store._backfill_missing_document_versions()
+
+    assert store._conn.document_versions == {("doc-legacy", 7)}
+    assert store._conn.commits == 1
 
 
 def test_duplicate_index_errno_rechecks_and_accepts_matching_race_shape():
@@ -597,3 +675,38 @@ def test_duplicate_foreign_key_errno_rechecks_and_accepts_matching_reference():
     )
 
     store._ensure_document_chunks_shape()
+
+
+def test_foreign_key_with_restrict_delete_rule_is_rejected():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.foreign_keys["fk_document_chunks_version"] = (
+        ("doc_id", "document_version"),
+        "document_versions",
+        ("doc_id", "version"),
+        "RESTRICT",
+    )
+
+    with pytest.raises(RuntimeError, match="foreign key shape"):
+        store._ensure_document_chunks_shape()
+
+
+def test_duplicate_foreign_key_errno_rechecks_delete_rule():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ChunkShapeConnection(current=True)
+    store._conn.foreign_keys.clear()
+    store._conn.alter_races["ADD CONSTRAINT fk_document_chunks_version"] = (
+        RuntimeError(1826, "Duplicate foreign key"),
+        lambda connection: connection.foreign_keys.__setitem__(
+            "fk_document_chunks_version",
+            (
+                ("doc_id", "document_version"),
+                "document_versions",
+                ("doc_id", "version"),
+                "RESTRICT",
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="foreign key shape"):
+        store._ensure_document_chunks_shape()
