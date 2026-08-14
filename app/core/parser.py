@@ -6,13 +6,24 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
+import re
+import tempfile
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from KBzhy.app.core.document_models import DocumentElement, ParsedDocument
+from KBzhy.config import PARSED_ARTIFACT_DIR
+
 logger = logging.getLogger(__name__)
+
+
+class ParsedArtifactError(ValueError):
+    """Raised when a parsed artifact does not match the persisted schema."""
 
 
 class Document:
@@ -45,9 +56,14 @@ class DocumentParser:
         "image": [".jpg", ".jpeg", ".png", ".bmp", ".tiff"],
     }
 
-    def __init__(self, vlm_model: str | None = None):
+    def __init__(
+        self,
+        vlm_model: str | None = None,
+        artifact_dir: str | Path | None = None,
+    ):
         self._vlm_model = vlm_model
         self._ext_map = self._build_ext_map()
+        self._artifact_dir = Path(artifact_dir or PARSED_ARTIFACT_DIR).resolve()
 
     def _build_ext_map(self) -> dict[str, str]:
         mapping: dict[str, str] = {}
@@ -93,6 +109,204 @@ class DocumentParser:
             doc.metadata.setdefault("source", filename)
             doc.metadata.setdefault("file_type", category)
         return docs
+
+    def parse_structured(
+        self,
+        file_path: str | Path,
+        *,
+        document_id: str,
+        version: int,
+        kb_id: str = "default",
+    ) -> ParsedDocument:
+        self._validate_identifier(document_id, "document_id")
+        self._validate_identifier(kb_id, "kb_id")
+        self._validate_version(version)
+
+        source = Path(file_path)
+        documents = self.parse(source)
+        metadata = dict(documents[0].metadata) if documents else {}
+        metadata["kb_id"] = kb_id
+        return ParsedDocument(
+            document_id=document_id,
+            version=version,
+            title=source.stem,
+            language="und",
+            elements=self._legacy_to_elements(documents, document_id),
+            metadata=metadata,
+        )
+
+    def save_artifact(self, parsed: ParsedDocument) -> Path:
+        kb_id = parsed.metadata.get("kb_id", "default")
+        self._validate_identifier(kb_id, "kb_id")
+        self._validate_identifier(parsed.document_id, "document_id")
+        self._validate_version(parsed.version)
+
+        target_dir = self._artifact_dir / kb_id / parsed.document_id
+        self._resolve_artifact_path(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = self._resolve_artifact_path(target_dir)
+        target = self._resolve_artifact_path(target_dir / f"v{parsed.version}.json")
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target_dir,
+                prefix=f".{target.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                json.dump(asdict(parsed), temp_file, ensure_ascii=False, separators=(",", ":"))
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            temp_path = self._resolve_artifact_path(temp_path)
+            target = self._resolve_artifact_path(target)
+            os.replace(temp_path, target)
+        except Exception:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            raise
+        return target
+
+    def load_artifact(self, path: str | Path) -> ParsedDocument:
+        artifact_path = self._resolve_artifact_path(path)
+        try:
+            data = json.loads(artifact_path.read_text(encoding="utf-8"))
+            return self._decode_artifact(data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, ParsedArtifactError):
+                raise
+            raise ParsedArtifactError("invalid parsed artifact") from exc
+
+    def _decode_artifact(self, data: object) -> ParsedDocument:
+        if not isinstance(data, dict):
+            raise ParsedArtifactError("invalid parsed artifact: root must be an object")
+        for field in ("document_id", "version", "title", "language", "elements", "metadata"):
+            if field not in data:
+                raise ParsedArtifactError(f"invalid parsed artifact: missing {field}")
+
+        self._validate_identifier(data["document_id"], "document_id")
+        self._validate_version(data["version"])
+        if not isinstance(data["elements"], list):
+            raise ParsedArtifactError("invalid parsed artifact: elements must be a list")
+        if not isinstance(data["metadata"], dict):
+            raise ParsedArtifactError("invalid parsed artifact: metadata must be an object")
+        if not isinstance(data["title"], str):
+            raise ParsedArtifactError("invalid parsed artifact: title must be a string")
+        if not isinstance(data["language"], str):
+            raise ParsedArtifactError("invalid parsed artifact: language must be a string")
+
+        elements = tuple(self._decode_element(element) for element in data["elements"])
+        return ParsedDocument(
+            document_id=data["document_id"],
+            version=data["version"],
+            title=data["title"],
+            language=data["language"],
+            elements=elements,
+            metadata=data["metadata"],
+        )
+
+    @staticmethod
+    def _decode_element(data: object) -> DocumentElement:
+        if not isinstance(data, dict):
+            raise ParsedArtifactError("invalid parsed artifact: element must be an object")
+        required = ("element_id", "element_type", "text", "order")
+        if any(field not in data for field in required):
+            raise ParsedArtifactError("invalid parsed artifact: element fields are incomplete")
+        if not isinstance(data["element_id"], str) or not data["element_id"]:
+            raise ParsedArtifactError("invalid parsed artifact: element_id must be a string")
+        if data["element_type"] not in {"heading", "paragraph", "list", "table", "code"}:
+            raise ParsedArtifactError("invalid parsed artifact: invalid element_type")
+        if not isinstance(data["text"], str):
+            raise ParsedArtifactError("invalid parsed artifact: text must be a string")
+        if isinstance(data["order"], bool) or not isinstance(data["order"], int):
+            raise ParsedArtifactError("invalid parsed artifact: order must be an integer")
+        page = data.get("page")
+        if page is not None and (isinstance(page, bool) or not isinstance(page, int)):
+            raise ParsedArtifactError("invalid parsed artifact: page must be an integer")
+        section_path = data.get("section_path", [])
+        if not isinstance(section_path, list) or not all(isinstance(part, str) for part in section_path):
+            raise ParsedArtifactError("invalid parsed artifact: section_path must be a string list")
+        bounding_box = data.get("bounding_box")
+        if bounding_box is not None and (
+            not isinstance(bounding_box, dict)
+            or not all(
+                isinstance(key, str)
+                and not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                for key, value in bounding_box.items()
+            )
+        ):
+            raise ParsedArtifactError("invalid parsed artifact: bounding_box must contain numbers")
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ParsedArtifactError("invalid parsed artifact: element metadata must be an object")
+        return DocumentElement(
+            element_id=data["element_id"],
+            element_type=data["element_type"],
+            text=data["text"],
+            order=data["order"],
+            page=page,
+            section_path=tuple(section_path),
+            bounding_box=bounding_box,
+            metadata=metadata,
+        )
+
+    def _resolve_artifact_path(self, path: str | Path) -> Path:
+        resolved = Path(path).resolve()
+        try:
+            resolved.relative_to(self._artifact_dir)
+        except ValueError as exc:
+            raise ValueError("artifact path must stay within artifact_dir") from exc
+        return resolved
+
+    @staticmethod
+    def _legacy_to_elements(
+        documents: list[Document],
+        document_id: str,
+    ) -> tuple[DocumentElement, ...]:
+        elements: list[DocumentElement] = []
+        for order, document in enumerate(documents):
+            metadata = dict(document.metadata)
+            is_table = metadata.get("file_type") in {"excel", "csv"} or "sheet" in metadata
+            elements.append(
+                DocumentElement(
+                    element_id=f"{document_id}:legacy:{order}",
+                    element_type="table" if is_table else "paragraph",
+                    text=document.content,
+                    order=order,
+                    page=metadata.get("page"),
+                    section_path=DocumentParser._normalize_section_path(
+                        metadata.get("section_path")
+                    ),
+                    bounding_box=metadata.get("bounding_box"),
+                    metadata=metadata,
+                )
+            )
+        return tuple(elements)
+
+    @staticmethod
+    def _normalize_section_path(value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        if isinstance(value, (list, tuple)) and all(isinstance(part, str) for part in value):
+            return tuple(value)
+        raise ParsedArtifactError("invalid legacy section_path")
+
+    @staticmethod
+    def _validate_identifier(value: object, field: str) -> None:
+        if not isinstance(value, str) or not value or value in {".", ".."}:
+            raise ValueError(f"{field} must be a safe path segment")
+        if re.fullmatch(r"[\w.-]+", value) is None:
+            raise ValueError(f"{field} must be a safe path segment")
+
+    @staticmethod
+    def _validate_version(version: object) -> None:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("version must be a positive integer")
 
     # ── PDF ────────────────────────────────────
 
