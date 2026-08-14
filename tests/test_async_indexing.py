@@ -79,15 +79,14 @@ class InMemoryStore:
         self.versions[(document_id, version)] = {
             "content_hash": content_hash,
             "storage_path": storage_path,
+            "filename": filename,
+            "file_type": file_type,
             "status": "staging",
         }
         document.update(
-            filename=filename,
-            file_type=file_type,
             status="queued",
             chunk_count=0,
             task_id=task_id,
-            storage_path=storage_path,
             error_message=None,
             updated_at=now,
         )
@@ -100,6 +99,108 @@ class InMemoryStore:
             "index_version": 1,
         }
         return version
+
+    def get_document_version(self, doc_id, version):
+        item = self.versions.get((doc_id, version))
+        return dict(item) if item else None
+
+    def update_document_version_status(self, doc_id, version, status):
+        self.versions[(doc_id, version)]["status"] = status
+
+    def complete_indexing_task(self, task_id, chunk_count):
+        task = self.tasks[task_id]
+        document = self.documents[task["doc_id"]]
+        version = self.versions[(task["doc_id"], task["document_version"])]
+        if (
+            document.get("task_id") != task_id
+            or document.get("status") == "deleting"
+            or task.get("status") != "indexing"
+            or version.get("status") != "staging"
+        ):
+            raise RuntimeError("indexing task is no longer current")
+        for (doc_id, _), item in self.versions.items():
+            if doc_id == task["doc_id"] and item.get("status") == "active":
+                item["status"] = "inactive"
+        version["status"] = "active"
+        document.update(
+            filename=version.get("filename"),
+            file_type=version.get("file_type"),
+            storage_path=version.get("storage_path"),
+            content_hash=version.get("content_hash"),
+            current_version=task["document_version"],
+            active_index_version=task["index_version"],
+            status="ready",
+            chunk_count=chunk_count,
+            error_message=None,
+        )
+        task.update(status="ready", error_message=None)
+
+    def is_indexing_completion_committed(self, task_id):
+        task = self.tasks.get(task_id)
+        if not task or task.get("status") != "ready":
+            return False
+        document = self.documents.get(task["doc_id"])
+        version = self.versions.get((task["doc_id"], task.get("document_version")))
+        return bool(
+            document
+            and document.get("status") == "ready"
+            and document.get("task_id") == task_id
+            and int(document.get("current_version") or 0) == int(task.get("document_version") or 0)
+            and version
+            and version.get("status") == "active"
+        )
+
+    def finish_indexing_task(self, task_id, status, error_message):
+        task = self.tasks[task_id]
+        if task.get("status") not in {"queued", "parsing", "chunking", "indexing"}:
+            return False
+        document = self.documents.get(task["doc_id"])
+        version = self.versions.get((task["doc_id"], task.get("document_version")))
+        owns_document = bool(
+            document
+            and document.get("task_id") == task_id
+            and document.get("status") != "deleting"
+        )
+        task.update(status=status, error_message=error_message)
+        if version and version.get("status") == "staging":
+            version["status"] = status
+        if owns_document:
+            document.update(
+                status="ready" if int(document.get("current_version") or 0) > 0 else "failed",
+                error_message=error_message,
+            )
+        return True
+
+    def requeue_indexing_task(self, task_id):
+        task = self.tasks[task_id]
+        document = self.documents.get(task["doc_id"])
+        version = self.versions.get((task["doc_id"], task.get("document_version")))
+        if (
+            not document
+            or document.get("task_id") != task_id
+            or document.get("status") == "deleting"
+            or not version
+            or version.get("status") != "staging"
+        ):
+            return False
+        task.update(status="queued", error_message=None)
+        document.update(status="queued", error_message=None)
+        return True
+
+    def set_indexing_phase(self, task_id, phase):
+        task = self.tasks[task_id]
+        document = self.documents.get(task["doc_id"])
+        if (
+            not document
+            or document.get("task_id") != task_id
+            or document.get("status") == "deleting"
+            or task.get("status") != "parsing"
+        ):
+            return False
+        document.update(status=phase, error_message=None)
+        if phase == "indexing":
+            task["status"] = "indexing"
+        return True
 
     def update_document(self, doc_id, **changes):
         self.documents[doc_id].update(changes)
@@ -309,6 +410,9 @@ def test_changed_update_preserves_active_file_and_index_and_creates_staging_vers
     assert old_path.read_bytes() == b"old"
     assert store.documents["doc1"]["current_version"] == 1
     assert store.documents["doc1"]["content_hash"] == hashlib.sha256(b"old").hexdigest()
+    assert store.documents["doc1"]["filename"] == "old.txt"
+    assert store.documents["doc1"]["file_type"] == ".txt"
+    assert store.documents["doc1"]["storage_path"] == str(old_path)
     staging = store.versions[("doc1", 2)]
     assert Path(staging["storage_path"]).read_bytes() == b"new"
     assert response.task_id in staging["storage_path"]
@@ -389,6 +493,10 @@ def test_indexing_worker_rolls_back_vectors_and_marks_failed(tmp_path):
         "updated_at": datetime.now().isoformat(),
     }
     store.tasks["task1"] = {"task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued"}
+    store.tasks["task1"].update(document_version=1, index_version=1)
+    store.versions[("doc1", 1)] = {
+        "filename": "bad.txt", "file_type": ".txt", "storage_path": str(file_path), "status": "staging",
+    }
     removed = []
 
     class FailingEngine:
@@ -409,12 +517,370 @@ def test_indexing_worker_rolls_back_vectors_and_marks_failed(tmp_path):
     assert store.documents["doc1"]["status"] == "failed"
     assert "embedding failed" in store.documents["doc1"]["error_message"]
     assert store.tasks["task1"]["status"] == "failed"
+    assert store.versions[("doc1", 1)]["status"] == "failed"
     assert removed == [("bad.txt", "kb1", "doc1", "task1")]
 
 
-def test_indexing_worker_skips_stale_task_when_document_has_newer_task(tmp_path):
-    old_path = tmp_path / "old.txt"
-    old_path.write_text("old content", encoding="utf-8")
+def test_indexing_worker_failed_task_removes_only_its_safe_version_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    active_path = tmp_path / "kb1" / "doc1" / "v1" / "old.txt"
+    failed_path = tmp_path / "kb1" / "doc1" / "task2" / "new.txt"
+    active_path.parent.mkdir(parents=True)
+    failed_path.parent.mkdir(parents=True)
+    active_path.write_bytes(b"old")
+    failed_path.write_bytes(b"new")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": str(active_path), "content_hash": "old-hash", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 2,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(failed_path), "status": "staging",
+    }
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            raise RuntimeError("failed")
+
+        def remove_document(self, *args, **kwargs):
+            pass
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert active_path.read_bytes() == b"old"
+    assert not failed_path.parent.exists()
+    assert store.documents["doc1"]["filename"] == "old.txt"
+    assert store.documents["doc1"]["status"] == "ready"
+    assert store.versions[("doc1", 2)]["status"] == "failed"
+
+
+def test_indexing_worker_does_not_remove_version_path_outside_expected_boundary(tmp_path):
+    unsafe_path = tmp_path / "shared" / "new.txt"
+    unsafe_path.parent.mkdir()
+    unsafe_path.write_bytes(b"new")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": None, "file_type": None,
+        "storage_path": None, "content_hash": None, "current_version": 0,
+        "status": "queued", "task_id": "task1", "chunk_count": 0,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 1, "index_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(unsafe_path), "status": "staging",
+    }
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            raise RuntimeError("failed")
+
+        def remove_document(self, *args, **kwargs):
+            pass
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task1")
+
+    assert unsafe_path.read_bytes() == b"new"
+    assert store.documents["doc1"]["status"] == "failed"
+    assert store.documents["doc1"]["current_version"] == 0
+    assert store.documents["doc1"]["filename"] is None
+    assert store.documents["doc1"]["storage_path"] is None
+    assert store.versions[("doc1", 1)]["status"] == "failed"
+
+
+def test_indexing_worker_does_not_remove_matching_hierarchy_outside_upload_root(monkeypatch, tmp_path):
+    upload_root = tmp_path / "configured-uploads"
+    outside_path = tmp_path / "outside" / "kb1" / "doc1" / "task1" / "new.txt"
+    outside_path.parent.mkdir(parents=True)
+    outside_path.write_bytes(b"new")
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(upload_root))
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": None, "file_type": None,
+        "storage_path": None, "content_hash": None, "current_version": 0,
+        "status": "queued", "task_id": "task1", "chunk_count": 0,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 1, "index_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(outside_path), "status": "staging",
+    }
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            raise RuntimeError("failed")
+
+        def remove_document(self, *args, **kwargs):
+            pass
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task1")
+
+    assert outside_path.read_bytes() == b"new"
+
+
+def test_late_failure_after_activation_never_deletes_active_version(monkeypatch, tmp_path):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    active_path = tmp_path / "kb1" / "doc1" / "task2" / "new.txt"
+    active_path.parent.mkdir(parents=True)
+    active_path.write_bytes(b"new")
+
+    class ActivatedThenRaisedStore(InMemoryStore):
+        def complete_indexing_task(self, task_id, chunk_count):
+            super().complete_indexing_task(task_id, chunk_count)
+            raise RuntimeError("connection dropped after commit")
+
+        def finish_indexing_task(self, task_id, status, error_message):
+            if self.tasks[task_id]["status"] == "ready":
+                return False
+            return super().finish_indexing_task(task_id, status, error_message)
+
+    store = ActivatedThenRaisedStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": None, "content_hash": "old", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 1,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(active_path),
+        "content_hash": "new", "status": "staging",
+    }
+
+    removed = []
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            return 3
+
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert active_path.read_bytes() == b"new"
+    assert store.tasks["task2"]["status"] == "ready"
+    assert store.versions[("doc1", 2)]["status"] == "active"
+    assert store.documents["doc1"]["current_version"] == 2
+    assert removed == []
+
+
+def test_post_commit_exception_uses_authoritative_completion_check_not_stale_shared_reads(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    active_path = tmp_path / "kb1" / "doc1" / "task2" / "new.txt"
+    active_path.parent.mkdir(parents=True)
+    active_path.write_bytes(b"new")
+
+    class StaleSnapshotAfterCommitStore(InMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.completion_checks = 0
+            self.return_stale_shared_reads = False
+
+        def complete_indexing_task(self, task_id, chunk_count):
+            super().complete_indexing_task(task_id, chunk_count)
+            self.return_stale_shared_reads = True
+            raise RuntimeError("connection dropped after commit")
+
+        def get_task(self, task_id):
+            if self.return_stale_shared_reads:
+                return {**self.tasks[task_id], "status": "indexing"}
+            return super().get_task(task_id)
+
+        def get_document(self, kb_id, doc_id):
+            if self.return_stale_shared_reads:
+                return {**self.documents[doc_id], "status": "indexing", "current_version": 1}
+            return super().get_document(kb_id, doc_id)
+
+        def get_document_version(self, doc_id, version):
+            if self.return_stale_shared_reads:
+                return {**self.versions[(doc_id, version)], "status": "staging"}
+            return super().get_document_version(doc_id, version)
+
+        def is_indexing_completion_committed(self, task_id):
+            self.completion_checks += 1
+            return InMemoryStore.is_indexing_completion_committed(self, task_id)
+
+    store = StaleSnapshotAfterCommitStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": None, "content_hash": "old", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 1,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(active_path),
+        "content_hash": "new", "status": "staging",
+    }
+    removed = []
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            return 3
+
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert store.completion_checks == 1
+    assert active_path.read_bytes() == b"new"
+    assert removed == []
+
+
+def test_post_commit_exception_cleans_up_when_fresh_completion_check_is_incomplete(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    staging_path = tmp_path / "kb1" / "doc1" / "task2" / "new.txt"
+    staging_path.parent.mkdir(parents=True)
+    staging_path.write_bytes(b"new")
+
+    class IncompleteCompletionStore(InMemoryStore):
+        def complete_indexing_task(self, task_id, chunk_count):
+            raise RuntimeError("commit failed")
+
+        def is_indexing_completion_committed(self, task_id):
+            return False
+
+    store = IncompleteCompletionStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": None, "content_hash": "old", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 1,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(staging_path),
+        "content_hash": "new", "status": "staging",
+    }
+    removed = []
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            return 3
+
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert removed
+    assert store.tasks["task2"]["status"] == "failed"
+    assert not staging_path.parent.exists()
+
+
+def test_post_commit_exception_preserves_state_when_authoritative_check_itself_fails(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    staging_path = tmp_path / "kb1" / "doc1" / "task2" / "new.txt"
+    staging_path.parent.mkdir(parents=True)
+    staging_path.write_bytes(b"new")
+
+    class FailingCompletionCheckStore(InMemoryStore):
+        def complete_indexing_task(self, task_id, chunk_count):
+            raise RuntimeError("commit result unknown")
+
+        def is_indexing_completion_committed(self, task_id):
+            raise RuntimeError("fresh read failed")
+
+    store = FailingCompletionCheckStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": None, "content_hash": "old", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 1,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(staging_path),
+        "content_hash": "new", "status": "staging",
+    }
+    removed = []
+
+    class Engine:
+        def index_document(self, *args, **kwargs):
+            return 3
+
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert removed == []
+    assert store.tasks["task2"]["status"] == "indexing"
+    assert store.documents["doc1"]["status"] == "indexing"
+    assert store.versions[("doc1", 2)]["status"] == "staging"
+    assert staging_path.read_bytes() == b"new"
+
+
+def test_indexing_worker_reads_file_metadata_from_task_document_version(tmp_path):
+    active_path = tmp_path / "v1" / "old.txt"
+    staging_path = tmp_path / "task2" / "new.txt"
+    active_path.parent.mkdir()
+    staging_path.parent.mkdir()
+    active_path.write_bytes(b"old")
+    staging_path.write_bytes(b"new")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "old.txt", "file_type": ".txt",
+        "storage_path": str(active_path), "content_hash": "old-hash", "current_version": 1,
+        "status": "queued", "task_id": "task2", "chunk_count": 2,
+    }
+    store.tasks["task2"] = {
+        "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "file_type": ".txt", "storage_path": str(staging_path),
+        "content_hash": "new-hash", "status": "staging",
+    }
+
+    class Engine:
+        def index_document(self, path, kb_id, display_name=None, doc_id=None, task_id=None):
+            assert path == str(staging_path)
+            assert display_name == "new.txt"
+            return 1
+
+    IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False).process_task("task2")
+
+    assert store.tasks["task2"]["status"] == "ready"
+    assert store.documents["doc1"]["filename"] == "new.txt"
+    assert store.documents["doc1"]["storage_path"] == str(staging_path)
+    assert store.documents["doc1"]["content_hash"] == "new-hash"
+    assert store.documents["doc1"]["current_version"] == 2
+    assert store.versions[("doc1", 2)]["status"] == "active"
+
+
+def test_indexing_worker_skips_stale_task_when_document_has_newer_task(monkeypatch, tmp_path):
+    monkeypatch.setattr("KBzhy.app.core.indexing_worker.UPLOAD_STORAGE_DIR", str(tmp_path))
+    active_path = tmp_path / "kb1" / "doc1" / "v1" / "new.txt"
+    stale_path = tmp_path / "kb1" / "doc1" / "task1" / "old.txt"
+    active_path.parent.mkdir(parents=True)
+    stale_path.parent.mkdir(parents=True)
+    active_path.write_text("new content", encoding="utf-8")
+    stale_path.write_text("old content", encoding="utf-8")
     store = InMemoryStore()
     store.documents["doc1"] = {
         "id": "doc1",
@@ -424,11 +890,18 @@ def test_indexing_worker_skips_stale_task_when_document_has_newer_task(tmp_path)
         "status": "queued",
         "chunk_count": 0,
         "task_id": "task2",
-        "storage_path": str(old_path),
+        "storage_path": str(active_path),
+        "current_version": 1,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat(),
     }
-    store.tasks["task1"] = {"task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued"}
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "old.txt", "file_type": ".txt", "storage_path": str(stale_path), "status": "staging",
+    }
     called = False
 
     class Engine:
@@ -444,6 +917,224 @@ def test_indexing_worker_skips_stale_task_when_document_has_newer_task(tmp_path)
     assert store.tasks["task1"]["status"] == "stale"
     assert store.documents["doc1"]["status"] == "queued"
     assert store.documents["doc1"]["task_id"] == "task2"
+    assert store.versions[("doc1", 2)]["status"] == "stale"
+    assert not stale_path.parent.exists()
+    assert active_path.read_text(encoding="utf-8") == "new content"
+
+
+def test_indexing_worker_marks_task_failed_when_version_metadata_is_missing():
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": None, "file_type": None,
+        "storage_path": None, "content_hash": None, "current_version": 0,
+        "status": "queued", "task_id": "task1", "chunk_count": 0,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 1, "index_version": 1,
+    }
+
+    IndexingWorker(store=store, engine_factory=lambda: None, autostart=False).process_task("task1")
+
+    assert store.tasks["task1"]["status"] == "failed"
+    assert store.documents["doc1"]["status"] == "failed"
+    assert store.documents["doc1"]["current_version"] == 0
+    assert store.documents["doc1"]["filename"] is None
+    assert store.documents["doc1"]["storage_path"] is None
+
+
+def test_old_task_late_failure_does_not_change_newer_document_state(tmp_path):
+    stale_path = tmp_path / "kb1" / "doc1" / "task1" / "old.txt"
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_bytes(b"old")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "new.txt", "status": "indexing",
+        "task_id": "task2", "current_version": 1, "chunk_count": 7,
+        "storage_path": str(tmp_path / "kb1" / "doc1" / "v1" / "new.txt"),
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "old.txt", "storage_path": str(stale_path), "status": "staging",
+    }
+
+    IndexingWorker(store=store, engine_factory=lambda: None, autostart=False).process_task("task1")
+
+    assert store.tasks["task1"]["status"] == "stale"
+    assert store.documents["doc1"]["status"] == "indexing"
+    assert store.documents["doc1"]["task_id"] == "task2"
+    assert store.documents["doc1"]["chunk_count"] == 7
+
+
+def test_worker_does_not_revive_deleting_document(tmp_path):
+    version_path = tmp_path / "kb1" / "doc1" / "task1" / "new.txt"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(b"new")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1", "status": "deleting",
+        "current_version": 1, "storage_path": None, "chunk_count": 4,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "storage_path": str(version_path), "status": "staging",
+    }
+
+    IndexingWorker(
+        store=store,
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("deleting document must not index")),
+        autostart=False,
+    ).process_task("task1")
+
+    assert store.documents["doc1"]["status"] == "deleting"
+    assert store.documents["doc1"]["chunk_count"] == 4
+    assert store.tasks["task1"]["status"] == "stale"
+    assert store.versions[("doc1", 2)]["status"] == "stale"
+
+
+def test_worker_losing_ownership_after_claim_never_changes_newer_document(tmp_path):
+    version_path = tmp_path / "kb1" / "doc1" / "task1" / "new.txt"
+    version_path.parent.mkdir(parents=True)
+    version_path.write_bytes(b"new")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1", "status": "queued",
+        "current_version": 1, "storage_path": None, "chunk_count": 4,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "filename": "new.txt", "storage_path": str(version_path), "status": "staging",
+    }
+
+    def claim_and_replace(task_id):
+        store.tasks[task_id]["status"] = "parsing"
+        store.documents["doc1"].update(task_id="task2", status="queued", chunk_count=8)
+        return True
+
+    store.claim_task = claim_and_replace
+    worker = IndexingWorker(
+        store=store,
+        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("stale task must not index")),
+        autostart=False,
+    )
+    worker.process_task("task1")
+
+    assert store.documents["doc1"]["task_id"] == "task2"
+    assert store.documents["doc1"]["status"] == "queued"
+    assert store.documents["doc1"]["chunk_count"] == 8
+    assert store.tasks["task1"]["status"] == "stale"
+
+
+def test_recovery_does_not_requeue_newer_or_deleting_document(tmp_path):
+    store = InMemoryStore()
+    store.list_recoverable_tasks = lambda: [store.tasks["old"], store.tasks["deleting"]]
+    for doc_id, task_id, status in (("doc-old", "new", "indexing"), ("doc-del", "deleting", "deleting")):
+        path = tmp_path / "kb1" / doc_id / ("old" if doc_id == "doc-old" else task_id) / "x.txt"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x")
+        old_task = "old" if doc_id == "doc-old" else "deleting"
+        store.documents[doc_id] = {
+            "id": doc_id, "kb_id": "kb1", "task_id": task_id, "status": status,
+            "current_version": 1, "storage_path": None,
+        }
+        store.tasks[old_task] = {
+            "task_id": old_task, "doc_id": doc_id, "kb_id": "kb1", "status": "indexing",
+            "document_version": 2, "index_version": 1,
+        }
+        store.versions[(doc_id, 2)] = {"filename": "x.txt", "storage_path": str(path), "status": "staging"}
+
+    worker = IndexingWorker(store=store, engine_factory=lambda: (_ for _ in ()).throw(AssertionError()), autostart=False)
+    worker.recover_unfinished_tasks()
+
+    assert store.tasks["old"]["status"] == "stale"
+    assert store.tasks["deleting"]["status"] == "stale"
+    assert store.documents["doc-old"]["status"] == "indexing"
+    assert store.documents["doc-del"]["status"] == "deleting"
+    assert worker._queue.empty()
+
+
+def test_recovery_does_not_remove_vectors_when_task_becomes_ready_after_listing(tmp_path):
+    path = tmp_path / "kb1" / "doc1" / "task1" / "doc.txt"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"content")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1", "status": "indexing",
+        "current_version": 0, "storage_path": None,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "indexing",
+        "document_version": 1, "index_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "doc.txt", "storage_path": str(path), "status": "staging",
+    }
+    task_snapshot = dict(store.tasks["task1"])
+    store.list_recoverable_tasks = lambda: [task_snapshot]
+
+    def finish_concurrently(_task_id):
+        store.tasks["task1"]["status"] = "ready"
+        store.documents["doc1"].update(status="ready", current_version=1)
+        store.versions[("doc1", 1)]["status"] = "active"
+        return False
+
+    store.requeue_indexing_task = finish_concurrently
+    removed = []
+
+    class Engine:
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    worker = IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False)
+    worker.recover_unfinished_tasks()
+
+    assert removed == []
+    assert store.tasks["task1"]["status"] == "ready"
+    assert store.documents["doc1"]["status"] == "ready"
+    assert store.documents["doc1"]["current_version"] == 1
+    assert store.versions[("doc1", 1)]["status"] == "active"
+    assert worker._queue.empty()
+
+
+def test_recovery_removes_interrupted_task_vectors_after_requeue_claim(tmp_path):
+    path = tmp_path / "kb1" / "doc1" / "task1" / "doc.txt"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"content")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1", "status": "indexing",
+        "current_version": 0, "storage_path": None,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "indexing",
+        "document_version": 1, "index_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "doc.txt", "storage_path": str(path), "status": "staging",
+    }
+    store.list_recoverable_tasks = lambda: [dict(store.tasks["task1"])]
+    removed = []
+
+    class Engine:
+        def remove_document(self, *args, **kwargs):
+            removed.append((args, kwargs))
+
+    worker = IndexingWorker(store=store, engine_factory=lambda: Engine(), autostart=False)
+    worker.recover_unfinished_tasks()
+
+    assert len(removed) == 1
+    assert store.tasks["task1"]["status"] == "queued"
+    assert store.documents["doc1"]["status"] == "queued"
+    assert worker._queue.get_nowait() == "task1"
 
 
 def test_indexing_worker_skips_task_that_was_already_claimed(tmp_path):

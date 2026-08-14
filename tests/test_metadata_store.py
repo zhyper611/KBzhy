@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from KBzhy.app.core import metadata_store
 from KBzhy.app.core.metadata_store import MySQLMetadataStore
 
 
@@ -68,8 +69,9 @@ class HealthyConnection:
 
 
 class SchemaConnection:
-    def __init__(self, existing_columns=(), alter_error=None, statement_error=None):
+    def __init__(self, existing_columns=(), alter_error=None, statement_error=None, missing_indexes=()):
         self.existing_columns = set(existing_columns)
+        self.missing_indexes = set(missing_indexes)
         self.alter_error = alter_error
         self.statement_error = statement_error
         self.executed = []
@@ -100,7 +102,12 @@ class SchemaConnection:
                         "uq_chunks_task_chunk": ("task_id", "chunk_id"),
                         "idx_chunks_doc_active_children": ("doc_id", "status", "chunk_type", "position"),
                         "idx_chunks_active_children": ("status", "chunk_type", "doc_id", "position"),
+                        "idx_documents_kb_hash": ("kb_id", "content_hash", "current_version", "status"),
+                        "idx_document_versions_hash_status": ("content_hash", "status", "doc_id", "version"),
+                        "idx_tasks_doc_version_status": ("doc_id", "document_version", "status", "task_id"),
                     }
+                    if tuple(params) in connection.missing_indexes:
+                        indexes[params[1]] = ()
                     unique = params[1] in {"PRIMARY", "uq_chunks_task_chunk"}
                     self._rows = [
                         {"COLUMN_NAME": name, "NON_UNIQUE": 0 if unique else 1}
@@ -123,6 +130,9 @@ class SchemaConnection:
                         parts = normalized.split()
                         connection.existing_columns.add((parts[2], parts[5]))
                     raise connection.alter_error
+                elif normalized.startswith("ALTER TABLE") and " ADD INDEX " in normalized:
+                    parts = normalized.split()
+                    connection.missing_indexes.discard((parts[2], parts[5]))
 
             def fetchone(self):
                 return self._row
@@ -169,6 +179,9 @@ def test_ensure_schema_creates_version_and_chunk_tables_and_new_columns():
     assert "FOREIGN KEY (doc_id, document_version) REFERENCES document_versions(doc_id, version) ON DELETE CASCADE" in sql
     assert "INDEX idx_chunks_doc_active_children (doc_id, status, chunk_type, position)" in sql
     assert "INDEX idx_chunks_active_children (status, chunk_type, doc_id, position)" in sql
+    assert "INDEX idx_documents_kb_hash (kb_id, content_hash, current_version, status)" in sql
+    assert "INDEX idx_document_versions_hash_status (content_hash, status, doc_id, version)" in sql
+    assert "INDEX idx_tasks_doc_version_status (doc_id, document_version, status, task_id)" in sql
     assert "ADD COLUMN active_collection_name VARCHAR(255) NULL" in sql
     assert "ADD COLUMN content_hash VARCHAR(64) NULL" in sql
     assert "ADD COLUMN current_version INT NOT NULL DEFAULT 1" in sql
@@ -218,6 +231,23 @@ def test_ensure_column_does_not_hide_other_alter_errors():
         store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
 
     assert exc_info.value.args[0] == 1061
+
+
+def test_ensure_query_index_adds_missing_legacy_index():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = SchemaConnection(missing_indexes={("document_versions", "idx_document_versions_hash_status")})
+
+    store._ensure_query_index(
+        "document_versions",
+        "idx_document_versions_hash_status",
+        ("content_hash", "status", "doc_id", "version"),
+    )
+
+    alter_sql = [sql for sql, _ in store._conn.executed if sql.startswith("ALTER TABLE")]
+    assert alter_sql == [
+        "ALTER TABLE document_versions ADD INDEX idx_document_versions_hash_status "
+        "(content_hash, status, doc_id, version)"
+    ]
 
 
 def test_create_connection_uses_saved_connection_configuration():
@@ -700,13 +730,14 @@ def test_foreign_key_with_restrict_delete_rule_is_rejected():
 
 
 class DocumentTransactionConnection:
-    def __init__(self, *, max_version=1, fail_on=None):
+    def __init__(self, *, max_version=1, fail_on=None, hash_rows=None):
         self.max_version = max_version
         self.fail_on = fail_on
         self.executed = []
         self.commits = 0
         self.rollbacks = 0
         self.closed = False
+        self.hash_rows = list(hash_rows or [])
 
     def cursor(self):
         connection = self
@@ -717,7 +748,11 @@ class DocumentTransactionConnection:
                 connection.executed.append((normalized, params))
                 if connection.fail_on and connection.fail_on in normalized:
                     raise RuntimeError("write failed")
-                if normalized.startswith("SELECT doc_id"):
+                if normalized.startswith("SELECT kb_id FROM knowledge_bases"):
+                    self.row = {"kb_id": "kb1"}
+                elif "AS hash_match_type" in normalized:
+                    self.row = connection.hash_rows.pop(0) if connection.hash_rows else None
+                elif normalized.startswith("SELECT doc_id"):
                     self.row = {"doc_id": "doc1", "current_version": 1, "content_hash": "active-hash"}
                 elif normalized.startswith("SELECT COALESCE(MAX(version)"):
                     self.row = {"max_version": connection.max_version}
@@ -742,12 +777,14 @@ class DocumentTransactionConnection:
         self.closed = True
 
 
-def _store_with_connection_factory(*, max_version=1, fail_on=None):
+def _store_with_connection_factory(*, max_version=1, fail_on=None, hash_rows=None):
     store = object.__new__(MySQLMetadataStore)
     connections = []
 
     def create_connection():
-        connection = DocumentTransactionConnection(max_version=max_version, fail_on=fail_on)
+        connection = DocumentTransactionConnection(
+            max_version=max_version, fail_on=fail_on, hash_rows=hash_rows
+        )
         connections.append(connection)
         return connection
 
@@ -785,6 +822,139 @@ def test_create_document_version_and_task_locks_document_and_uses_max_version():
     assert connection.closed is True
 
 
+def test_legacy_current_version_one_without_version_rows_advances_to_v2():
+    store, _ = _store_with_connection_factory(max_version=0)
+
+    version = store.create_document_version_and_task(
+        "doc1", "kb1", "new-hash", "/uploads/new.txt",
+        "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
+    )
+
+    assert version == 2
+
+
+def test_create_version_treats_current_pending_hash_as_unchanged():
+    store, connections = _store_with_connection_factory(hash_rows=[
+        None,
+        {
+            "doc_id": "doc1", "kb_id": "kb1", "hash_match_type": "pending",
+            "hash_task_id": "task1", "filename": "pending.txt", "status": "queued",
+            "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+        },
+    ])
+
+    with pytest.raises(metadata_store.DocumentContentUnchanged):
+        store.create_document_version_and_task(
+            "doc1", "kb1", "same-hash", "/uploads/new.txt",
+            "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
+        )
+
+    hash_queries = [item for item in connections[0].executed if "AS hash_match_type" in item[0]]
+    assert len(hash_queries) == 2
+    assert "d.doc_id<>%s" in hash_queries[0][0]
+    assert "d.doc_id<>%s" not in hash_queries[1][0]
+    assert connections[0].rollbacks == 1
+
+
+class IndexCompletionConnection:
+    def __init__(self):
+        self.task = {
+            "task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": "indexing",
+            "document_version": 2, "index_version": 4,
+        }
+        self.document = {
+            "doc_id": "doc1", "kb_id": "kb1", "task_id": "task2", "status": "indexing",
+            "current_version": 1,
+        }
+        self.version = {
+            "doc_id": "doc1", "version": 2, "status": "staging", "filename": "new.txt",
+            "file_type": ".txt", "storage_path": "/uploads/task2/new.txt",
+            "content_hash": "new-hash", "parser_version": None, "parsed_artifact_path": None,
+        }
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            rowcount = 0
+            row = None
+
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                connection.executed.append((normalized, params))
+                self.rowcount = 0
+                if normalized.startswith("SELECT doc_id, kb_id FROM document_index_tasks"):
+                    self.row = {"doc_id": connection.task["doc_id"], "kb_id": connection.task["kb_id"]}
+                elif normalized.startswith("SELECT * FROM document_index_tasks"):
+                    self.row = dict(connection.task)
+                elif normalized.startswith("SELECT * FROM documents"):
+                    self.row = dict(connection.document)
+                elif normalized.startswith("SELECT * FROM document_versions"):
+                    self.row = dict(connection.version) if connection.version["status"] == "staging" else None
+                elif normalized.startswith("UPDATE document_versions SET status='inactive'"):
+                    self.row = None
+                elif normalized.startswith("UPDATE document_versions SET status='active'"):
+                    connection.version["status"] = "active"
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE documents"):
+                    connection.document.update(
+                        filename=params[0], file_type=params[1], storage_path=params[2],
+                        content_hash=params[3], current_version=params[6],
+                        active_index_version=params[7], status="ready", chunk_count=params[8],
+                    )
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE document_index_tasks"):
+                    connection.task["status"] = "ready"
+                    self.rowcount = 1
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+def test_complete_indexing_task_activates_metadata_and_task_in_one_transaction():
+    connection = IndexCompletionConnection()
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    store.complete_indexing_task("task2", 9)
+
+    assert connection.document["filename"] == "new.txt"
+    assert connection.document["current_version"] == 2
+    assert connection.document["active_index_version"] == 4
+    assert connection.document["chunk_count"] == 9
+    assert connection.version["status"] == "active"
+    assert connection.task["status"] == "ready"
+    assert connection.commits == 1
+    assert connection.rollbacks == 0
+    assert connection.closed is True
+    sql = [statement for statement, _ in connection.executed]
+    prefetch = next(i for i, statement in enumerate(sql) if statement.startswith("SELECT doc_id, kb_id FROM document_index_tasks"))
+    document_lock = next(i for i, statement in enumerate(sql) if statement.startswith("SELECT * FROM documents") and statement.endswith("FOR UPDATE"))
+    task_lock = next(i for i, statement in enumerate(sql) if statement.startswith("SELECT * FROM document_index_tasks") and statement.endswith("FOR UPDATE"))
+    version_lock = next(i for i, statement in enumerate(sql) if statement.startswith("SELECT * FROM document_versions") and statement.endswith("FOR UPDATE"))
+    assert prefetch < document_lock < task_lock < version_lock
+    assert any("task_id=%s AND status<>'deleting'" in statement for statement in sql)
+    assert any("document_version=%s AND status='indexing'" in statement for statement in sql)
+
+
 def test_create_document_version_and_task_rolls_back_all_writes():
     store, connections = _store_with_connection_factory(fail_on="INSERT INTO document_index_tasks")
 
@@ -797,6 +967,42 @@ def test_create_document_version_and_task_rolls_back_all_writes():
     assert connections[0].commits == 0
     assert connections[0].rollbacks == 1
     assert connections[0].closed is True
+
+
+def test_get_document_version_queries_exact_version_and_returns_dict():
+    store = object.__new__(MySQLMetadataStore)
+    cursor = FakeCursor(rows=[{"doc_id": "doc1", "version": 2, "filename": "new.txt"}])
+    captured = {}
+
+    def execute(sql, params=()):
+        captured["sql"] = " ".join(sql.split())
+        captured["params"] = params
+        return cursor
+
+    store._execute = execute
+
+    assert store.get_document_version("doc1", 2)["filename"] == "new.txt"
+    assert captured["params"] == ("doc1", 2)
+    assert "WHERE doc_id=%s AND version=%s" in captured["sql"]
+
+
+def test_update_document_version_status_targets_exact_staging_version():
+    store = object.__new__(MySQLMetadataStore)
+    cursor = FakeCursor()
+    store._conn = type("Connection", (), {"commit": lambda self: None})()
+    captured = {}
+
+    def execute(sql, params=()):
+        captured["sql"] = " ".join(sql.split())
+        captured["params"] = params
+        return cursor
+
+    store._execute = execute
+
+    store.update_document_version_status("doc1", 2, "failed")
+
+    assert captured["params"] == ("failed", "doc1", 2)
+    assert "doc_id=%s AND version=%s AND status='staging'" in captured["sql"]
 
 
 def test_create_document_with_task_creates_v1_staging_and_versioned_task():
@@ -876,7 +1082,11 @@ class ConcurrentVersionConnection:
 
     def execute(self, sql, params=()):
         normalized = " ".join(sql.split())
-        if normalized.startswith("SELECT doc_id"):
+        if normalized.startswith("SELECT kb_id FROM knowledge_bases"):
+            self.row = {"kb_id": "kb1"}
+        elif "AS hash_match_type" in normalized:
+            self.row = None
+        elif normalized.startswith("SELECT doc_id"):
             with self.database.attempt_lock:
                 self.database.lock_attempts += 1
                 first_attempt = self.database.lock_attempts == 1
@@ -937,7 +1147,7 @@ def test_concurrent_document_updates_use_independent_locked_transactions_for_con
     assert all(connection.closed for connection in database.connections)
 
 
-def test_find_document_by_hash_matches_active_or_staging_hash_and_excludes_deleting():
+def test_find_document_by_hash_only_reserves_active_or_recoverable_staging_hashes():
     store = object.__new__(MySQLMetadataStore)
     cursor = FakeCursor(rows=[{
         "doc_id": "doc1", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
@@ -959,7 +1169,487 @@ def test_find_document_by_hash_matches_active_or_staging_hash_and_excludes_delet
     assert result["id"] == "doc1"
     assert "d.status<>'deleting'" in captured["sql"]
     assert "dv.status='staging'" in captured["sql"]
-    assert captured["params"] == ("kb1", "same-hash", "same-hash")
+    assert "dit.status IN ('queued', 'parsing', 'chunking', 'indexing')" in captured["sql"]
+    assert "dit.status IN ('queued', 'parsing', 'chunking', 'indexing', 'failed', 'stale')" not in captured["sql"]
+    assert "ORDER BY" in captured["sql"]
+
+
+def test_find_document_by_hash_returns_match_metadata():
+    store = object.__new__(MySQLMetadataStore)
+    cursor = FakeCursor(rows=[{
+        "doc_id": "doc1", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
+        "status": "ready", "chunk_count": 2, "task_id": "active-task", "storage_path": "/guide.txt",
+        "content_hash": "same-hash", "current_version": 1, "active_index_version": 1,
+        "hash_match_type": "pending", "hash_task_id": "pending-task",
+        "created_at": "2026-08-13T10:00:00", "updated_at": "2026-08-13T10:00:00",
+    }])
+    store._execute = lambda sql, params=(): cursor
+
+    result = store.find_document_by_hash("kb1", "same-hash")
+
+    assert result["match_type"] == "pending"
+    assert result["match_task_id"] == "pending-task"
+
+
+class ConcurrentHashDatabase:
+    def __init__(self):
+        self.kb_lock = threading.Lock()
+        self.attempt_lock = threading.Lock()
+        self.second_lock_attempt = threading.Event()
+        self.lock_attempts = 0
+        self.documents = []
+        self.connections = []
+
+    def connect(self):
+        connection = ConcurrentHashConnection(self)
+        self.connections.append(connection)
+        return connection
+
+
+class ConcurrentHashConnection:
+    def __init__(self, database):
+        self.database = database
+        self.locked = False
+        self.pending_document = None
+        self.row = None
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.split())
+        if normalized.startswith("SELECT kb_id FROM knowledge_bases") and normalized.endswith("FOR UPDATE"):
+            with self.database.attempt_lock:
+                self.database.lock_attempts += 1
+                first_attempt = self.database.lock_attempts == 1
+                if self.database.lock_attempts == 2:
+                    self.database.second_lock_attempt.set()
+            self.database.kb_lock.acquire()
+            self.locked = True
+            if first_attempt:
+                assert self.database.second_lock_attempt.wait(timeout=2)
+            self.row = {"kb_id": params[0]}
+        elif "AS hash_match_type" in normalized:
+            content_hash = next(value for value in params if value == "same-hash")
+            duplicate = next((item for item in self.database.documents if item["content_hash"] == content_hash), None)
+            self.row = duplicate
+        elif normalized.startswith("INSERT INTO documents"):
+            self.pending_document = {
+                "doc_id": params[0], "kb_id": params[1], "filename": params[2], "file_type": params[3],
+                "status": params[4], "chunk_count": params[5], "task_id": params[6], "storage_path": params[7],
+                "error_message": params[8], "content_hash": params[9], "current_version": params[10],
+                "active_index_version": params[11], "created_at": params[12], "updated_at": params[13],
+                "hash_match_type": "pending", "hash_task_id": params[6],
+            }
+            self.row = None
+        elif normalized.startswith("INSERT INTO document_versions"):
+            self.pending_document["content_hash"] = params[3]
+            self.row = None
+        else:
+            self.row = None
+
+    def fetchone(self):
+        return self.row
+
+    def commit(self):
+        if self.pending_document:
+            self.database.documents.append(self.pending_document)
+        self._unlock()
+
+    def rollback(self):
+        self._unlock()
+
+    def _unlock(self):
+        if self.locked:
+            self.locked = False
+            self.database.kb_lock.release()
+
+    def close(self):
+        pass
+
+
+def test_concurrent_same_hash_uploads_are_serialized_and_one_is_rejected():
+    database = ConcurrentHashDatabase()
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = database.connect
+
+    def create(document_number):
+        now = "2026-08-13T10:00:00"
+        document = {
+            "id": f"doc-{document_number}", "kb_id": "kb1", "filename": "guide.txt", "file_type": ".txt",
+            "status": "queued", "chunk_count": 0, "task_id": f"task-{document_number}",
+            "storage_path": f"/uploads/doc-{document_number}/guide.txt", "content_hash": "same-hash",
+            "created_at": now, "updated_at": now,
+        }
+        task = {
+            "task_id": f"task-{document_number}", "doc_id": f"doc-{document_number}", "kb_id": "kb1",
+            "status": "queued", "created_at": now, "updated_at": now,
+        }
+        try:
+            store.create_document_with_task(document, task)
+            return "created"
+        except metadata_store.DuplicateDocumentError as exc:
+            return exc.document_id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create, (1, 2)))
+
+    assert sorted(results) == ["created", "doc-1"]
+    assert len(database.documents) == 1
+
+
+def test_create_version_locks_knowledge_base_before_document_and_rechecks_hash():
+    store, connections = _store_with_connection_factory(max_version=1)
+
+    store.create_document_version_and_task(
+        "doc1", "kb1", "new-hash", "/uploads/new.txt",
+        "new.txt", ".txt", "task2", "2026-08-13T10:00:00",
+    )
+
+    statements = [sql for sql, _ in connections[0].executed]
+    kb_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT kb_id FROM knowledge_bases"))
+    hash_recheck = next(i for i, sql in enumerate(statements) if "AS hash_match_type" in sql)
+    document_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT doc_id"))
+    assert kb_lock < hash_recheck < document_lock
+
+
+def test_active_document_version_backfill_seeds_legacy_document_without_chunks():
+    store = object.__new__(MySQLMetadataStore)
+    cursor = FakeCursor()
+    store._conn = type("Connection", (), {
+        "cursor": lambda self: cursor,
+        "commit": lambda self: None,
+        "rollback": lambda self: None,
+    })()
+
+    store._backfill_active_document_versions()
+
+    sql, _ = cursor.executed[0]
+    normalized = " ".join(sql.split())
+    assert normalized.startswith("INSERT IGNORE INTO document_versions")
+    assert "FROM documents d" in normalized
+    assert "d.current_version > 0" in normalized
+    assert "d.filename" in normalized
+    assert "'active'" in normalized
+
+
+class ActiveVersionBackfillConnection:
+    def __init__(self):
+        self.documents = {"doc1": {
+            "doc_id": "doc1", "current_version": 1, "content_hash": "hash-v1",
+            "filename": "guide.pdf", "file_type": ".pdf", "storage_path": "/uploads/guide.pdf",
+            "parser_version": "parser-v1", "parsed_artifact_path": "/parsed/guide.json",
+            "created_at": "2026-08-13T10:00:00",
+        }}
+        self.versions = {("doc1", 1): {
+            "doc_id": "doc1", "version": 1, "content_hash": None, "filename": None,
+            "file_type": None, "storage_path": None, "parser_version": None,
+            "parsed_artifact_path": None, "status": "active",
+        }}
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                if normalized.startswith("INSERT IGNORE INTO document_versions"):
+                    return
+                if normalized.startswith("UPDATE document_versions dv INNER JOIN documents d"):
+                    for key, version in connection.versions.items():
+                        document = connection.documents[key[0]]
+                        if key[1] != document["current_version"]:
+                            continue
+                        for field in (
+                            "content_hash", "filename", "file_type", "storage_path",
+                            "parser_version", "parsed_artifact_path",
+                        ):
+                            if version[field] is None:
+                                version[field] = document[field]
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+def test_active_version_backfill_repairs_null_metadata_in_existing_legacy_row():
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = ActiveVersionBackfillConnection()
+
+    store._backfill_active_document_versions()
+
+    version = store._conn.versions[("doc1", 1)]
+    assert version["content_hash"] == "hash-v1"
+    assert version["filename"] == "guide.pdf"
+    assert version["file_type"] == ".pdf"
+    assert version["storage_path"] == "/uploads/guide.pdf"
+    assert version["parser_version"] == "parser-v1"
+    assert version["parsed_artifact_path"] == "/parsed/guide.json"
+
+
+class FinishTaskConnection:
+    def __init__(self, task_status):
+        self.task = {"task_id": "task2", "doc_id": "doc1", "kb_id": "kb1", "status": task_status, "document_version": 2}
+        self.document = {
+            "doc_id": "doc1", "kb_id": "kb1", "task_id": "task2",
+            "status": "ready" if task_status == "ready" else "indexing",
+            "current_version": 2 if task_status == "ready" else 1,
+        }
+        self.version = {"doc_id": "doc1", "version": 2, "status": "active" if task_status == "ready" else "staging"}
+        self.executed = []
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            rowcount = 0
+
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                connection.executed.append((normalized, params))
+                self.rowcount = 0
+                if normalized.startswith("SELECT doc_id, kb_id FROM document_index_tasks"):
+                    self.row = {"doc_id": connection.task["doc_id"], "kb_id": connection.task["kb_id"]}
+                elif normalized.startswith("SELECT * FROM document_index_tasks"):
+                    self.row = dict(connection.task)
+                elif normalized.startswith("SELECT * FROM documents"):
+                    self.row = dict(connection.document)
+                elif normalized.startswith("UPDATE document_index_tasks"):
+                    connection.task.update(status=params[0], error_message=params[1])
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE document_versions"):
+                    if connection.version["status"] == "staging":
+                        connection.version["status"] = params[0]
+                        self.rowcount = 1
+                elif normalized.startswith("UPDATE documents"):
+                    connection.document.update(status=params[0], error_message=params[1])
+                    self.rowcount = 1
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class CompletionCheckConnection:
+    def __init__(self, row=None, execute_error=None):
+        self.row = row
+        self.execute_error = execute_error
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+        self.cursor_closed = False
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            def execute(self, sql, params=()):
+                connection.executed.append((" ".join(sql.split()), params))
+                if connection.execute_error:
+                    raise connection.execute_error
+
+            def fetchone(self):
+                return connection.row
+
+            def close(self):
+                connection.cursor_closed = True
+
+        return Cursor()
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+def test_completion_check_uses_fresh_connection_and_exact_authoritative_state():
+    shared_connection = CompletionCheckConnection()
+    fresh_connection = CompletionCheckConnection(row={"committed": 1})
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = shared_connection
+    store.create_connection = lambda: fresh_connection
+
+    assert store.is_indexing_completion_committed("task2") is True
+
+    assert shared_connection.executed == []
+    sql, params = fresh_connection.executed[0]
+    assert "FROM document_index_tasks dit" in sql
+    assert "JOIN documents d" in sql
+    assert "JOIN document_versions dv" in sql
+    assert "dit.status='ready'" in sql
+    assert "d.status='ready'" in sql
+    assert "d.task_id=dit.task_id" in sql
+    assert "d.current_version=dit.document_version" in sql
+    assert "dv.status='active'" in sql
+    assert params == ("task2",)
+    assert fresh_connection.commits == 1
+    assert fresh_connection.cursor_closed is True
+    assert fresh_connection.closed is True
+
+
+def test_completion_check_failure_rolls_back_closes_and_propagates():
+    fresh_connection = CompletionCheckConnection(execute_error=RuntimeError("read failed"))
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: fresh_connection
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        store.is_indexing_completion_committed("task2")
+
+    assert fresh_connection.commits == 0
+    assert fresh_connection.rollbacks == 1
+    assert fresh_connection.cursor_closed is True
+    assert fresh_connection.closed is True
+
+
+@pytest.mark.parametrize("terminal_status", ["ready", "failed", "stale"])
+def test_finish_indexing_task_does_not_overwrite_terminal_task(terminal_status):
+    connection = FinishTaskConnection(terminal_status)
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    changed = store.finish_indexing_task("task2", "failed", "late failure")
+
+    assert changed is False
+    assert connection.task["status"] == terminal_status
+    assert not any(sql.startswith("UPDATE documents") for sql, _ in connection.executed)
+
+
+def test_finish_indexing_task_transitions_recoverable_task_and_locks_in_order():
+    connection = FinishTaskConnection("indexing")
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    changed = store.finish_indexing_task("task2", "failed", "embedding failed")
+
+    assert changed is True
+    assert connection.task["status"] == "failed"
+    assert connection.version["status"] == "failed"
+    statements = [sql for sql, _ in connection.executed]
+    document_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT * FROM documents"))
+    task_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT * FROM document_index_tasks"))
+    version_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT * FROM document_versions"))
+    assert document_lock < task_lock < version_lock
+
+
+class LifecycleLockOrderConnection:
+    def __init__(self, task_status="parsing", locked_doc_id="doc1"):
+        self.prefetch = {"doc_id": "doc1", "kb_id": "kb1"}
+        self.task = {
+            "task_id": "task1", "doc_id": locked_doc_id, "kb_id": "kb1",
+            "status": task_status, "document_version": 2,
+        }
+        self.document = {
+            "doc_id": "doc1", "kb_id": "kb1", "task_id": "task1",
+            "status": task_status, "current_version": 1,
+        }
+        self.version = {"doc_id": "doc1", "version": 2, "status": "staging"}
+        self.executed = []
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            rowcount = 0
+
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                connection.executed.append((normalized, params))
+                self.rowcount = 0
+                if normalized.startswith("SELECT doc_id, kb_id FROM document_index_tasks"):
+                    self.row = dict(connection.prefetch)
+                elif normalized.startswith("SELECT * FROM documents") or normalized.startswith("SELECT doc_id, task_id, status FROM documents"):
+                    self.row = dict(connection.document)
+                elif normalized.startswith("SELECT * FROM document_index_tasks"):
+                    self.row = dict(connection.task)
+                elif normalized.startswith("SELECT version FROM document_versions"):
+                    self.row = dict(connection.version)
+                elif normalized.startswith("UPDATE document_index_tasks SET status='queued'"):
+                    connection.task["status"] = "queued"
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE document_index_tasks SET status='indexing'"):
+                    connection.task["status"] = "indexing"
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE documents"):
+                    self.rowcount = 1
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("method_name", "task_status", "args"),
+    [
+        ("requeue_indexing_task", "indexing", ("task1",)),
+        ("set_indexing_phase", "parsing", ("task1", "indexing")),
+    ],
+)
+def test_worker_lifecycle_transactions_lock_document_before_task_and_version(
+    method_name, task_status, args
+):
+    connection = LifecycleLockOrderConnection(task_status=task_status)
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    assert getattr(store, method_name)(*args) is True
+
+    statements = [sql for sql, _ in connection.executed]
+    prefetch = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT doc_id, kb_id FROM document_index_tasks"))
+    document_lock = next(i for i, sql in enumerate(statements) if "FROM documents" in sql and sql.endswith("FOR UPDATE"))
+    task_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT * FROM document_index_tasks") and sql.endswith("FOR UPDATE"))
+    assert prefetch < document_lock < task_lock
+    if method_name == "requeue_indexing_task":
+        version_lock = next(i for i, sql in enumerate(statements) if sql.startswith("SELECT version FROM document_versions"))
+        assert task_lock < version_lock
+
+
+def test_task_owner_prefetch_is_not_used_as_authoritative_state():
+    connection = LifecycleLockOrderConnection(task_status="indexing", locked_doc_id="doc2")
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    changed = store.requeue_indexing_task("task1")
+
+    assert changed is False
+    assert not any(sql.startswith("UPDATE ") for sql, _ in connection.executed)
 
 
 def test_duplicate_foreign_key_errno_rechecks_delete_rule():

@@ -77,6 +77,36 @@ class ChunkRepository:
             cursor = connection.cursor()
             try:
                 cursor.execute(
+                    "SELECT doc_id, task_id, status FROM documents WHERE doc_id=%s FOR UPDATE",
+                    (document_id,),
+                )
+                document = cursor.fetchone()
+                if (
+                    not document
+                    or document.get("task_id") != task_id
+                    or document.get("status") == "deleting"
+                ):
+                    raise ValueError("indexing task no longer owns document")
+                cursor.execute(
+                    "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                    (task_id,),
+                )
+                task = cursor.fetchone()
+                if (
+                    not task
+                    or task.get("doc_id") != document_id
+                    or int(task.get("document_version") or 0) != version
+                    or task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+                ):
+                    raise ValueError("indexing task identity or status does not match staging target")
+                cursor.execute(
+                    "SELECT * FROM document_versions "
+                    "WHERE doc_id=%s AND version=%s AND status='staging' FOR UPDATE",
+                    (document_id, version),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("staging document version does not exist")
+                cursor.execute(
                     "DELETE FROM document_chunks WHERE task_id=%s AND status='staging'",
                     (task_id,),
                 )
@@ -98,11 +128,37 @@ class ChunkRepository:
             cursor = connection.cursor()
             try:
                 cursor.execute(
-                    "SELECT doc_id FROM documents WHERE doc_id=%s FOR UPDATE",
+                    "SELECT doc_id, task_id, status FROM documents WHERE doc_id=%s FOR UPDATE",
                     (document_id,),
                 )
-                if cursor.fetchone() is None:
+                document = cursor.fetchone()
+                cursor.execute(
+                    "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                    (task_id,),
+                )
+                task = cursor.fetchone()
+                if (
+                    not task
+                    or task.get("doc_id") != document_id
+                    or int(task.get("document_version") or 0) != version
+                    or task.get("status") != "indexing"
+                ):
+                    raise ValueError("indexing task identity or status does not match activation target")
+                if document is None:
                     raise ValueError("document does not exist")
+                if document.get("task_id") != task_id or document.get("status") == "deleting":
+                    raise ValueError("indexing task no longer owns document")
+                cursor.execute(
+                    """
+                    SELECT * FROM document_versions
+                    WHERE doc_id=%s AND version=%s AND status='staging'
+                    FOR UPDATE
+                    """,
+                    (document_id, version),
+                )
+                version_row = cursor.fetchone()
+                if version_row is None:
+                    raise ValueError("staging document version does not exist")
                 cursor.execute(
                     """
                     SELECT * FROM document_chunks
@@ -113,6 +169,8 @@ class ChunkRepository:
                 )
                 rows = cursor.fetchall()
                 index_version = self._validate_staging_batch(rows)
+                if int(task.get("index_version") or 0) != index_version:
+                    raise ValueError("indexing task index_version does not match staging batch")
                 expected_count = len(rows)
                 cursor.execute(
                     """
@@ -132,11 +190,48 @@ class ChunkRepository:
                     raise RuntimeError("activated chunk row count changed during transaction")
                 cursor.execute(
                     """
-                    UPDATE documents SET current_version=%s, active_index_version=%s, updated_at=NOW(3)
-                    WHERE doc_id=%s
+                    UPDATE document_versions SET status='inactive'
+                    WHERE doc_id=%s AND status='active'
                     """,
-                    (version, index_version, document_id),
+                    (document_id,),
                 )
+                cursor.execute(
+                    """
+                    UPDATE document_versions SET status='active'
+                    WHERE doc_id=%s AND version=%s AND status='staging'
+                    """,
+                    (document_id, version),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("document version status changed during transaction")
+                cursor.execute(
+                    """
+                    UPDATE documents
+                    SET content_hash=%s, filename=%s, file_type=%s, storage_path=%s,
+                        parser_version=%s, parsed_artifact_path=%s,
+                        current_version=%s, active_index_version=%s,
+                        status='ready', error_message=NULL, updated_at=NOW(3)
+                    WHERE doc_id=%s AND task_id=%s AND status<>'deleting'
+                    """,
+                    (
+                        version_row.get("content_hash"), version_row.get("filename"),
+                        version_row.get("file_type"), version_row.get("storage_path"),
+                        version_row.get("parser_version"), version_row.get("parsed_artifact_path"),
+                        version, index_version, document_id, task_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("document ownership changed during activation")
+                cursor.execute(
+                    """
+                    UPDATE document_index_tasks
+                    SET status='ready', error_message=NULL, updated_at=NOW(3)
+                    WHERE task_id=%s AND doc_id=%s AND document_version=%s AND status='indexing'
+                    """,
+                    (task_id, document_id, version),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("indexing task changed during activation")
                 connection.commit()
             except Exception:
                 connection.rollback()

@@ -49,9 +49,45 @@ _CHUNK_FOREIGN_KEYS = {
     ),
 }
 
+_QUERY_INDEXES = {
+    ("documents", "idx_documents_kb_hash"): ("kb_id", "content_hash", "current_version", "status"),
+    ("document_versions", "idx_document_versions_hash_status"): (
+        "content_hash", "status", "doc_id", "version",
+    ),
+    ("document_index_tasks", "idx_tasks_doc_version_status"): (
+        "doc_id", "document_version", "status", "task_id",
+    ),
+}
+
 
 class MetadataStoreUnavailable(RuntimeError):
     pass
+
+
+class DuplicateDocumentError(RuntimeError):
+    def __init__(self, document_id: str, match_type: str, task_id: str | None = None):
+        super().__init__(f"duplicate document content: {document_id}")
+        self.document_id = document_id
+        self.match_type = match_type
+        self.task_id = task_id
+
+
+class DocumentContentUnchanged(RuntimeError):
+    def __init__(self, document_id: str):
+        super().__init__(f"document content unchanged: {document_id}")
+        self.document_id = document_id
+
+
+class DocumentNotFoundError(RuntimeError):
+    def __init__(self, document_id: str):
+        super().__init__(f"document does not exist: {document_id}")
+        self.document_id = document_id
+
+
+class KnowledgeBaseNotFoundError(RuntimeError):
+    def __init__(self, kb_id: str):
+        super().__init__(f"knowledge base does not exist: {kb_id}")
+        self.kb_id = kb_id
 
 
 def now_iso() -> str:
@@ -140,10 +176,16 @@ class MySQLMetadataStore:
                 task_id VARCHAR(128) DEFAULT NULL,
                 storage_path TEXT DEFAULT NULL,
                 error_message TEXT DEFAULT NULL,
+                content_hash VARCHAR(64) NULL,
+                current_version INT NOT NULL DEFAULT 1,
+                parser_version VARCHAR(64) NULL,
+                active_index_version INT NOT NULL DEFAULT 1,
+                parsed_artifact_path TEXT NULL,
                 created_at DATETIME(3) NOT NULL,
                 updated_at DATETIME(3) NOT NULL,
                 INDEX idx_documents_kb (kb_id, updated_at),
                 INDEX idx_documents_task (task_id),
+                INDEX idx_documents_kb_hash (kb_id, content_hash, current_version, status),
                 CONSTRAINT fk_documents_kb FOREIGN KEY (kb_id)
                     REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -155,10 +197,14 @@ class MySQLMetadataStore:
                 kb_id VARCHAR(64) NOT NULL,
                 status VARCHAR(32) NOT NULL,
                 error_message TEXT DEFAULT NULL,
+                document_version INT NOT NULL DEFAULT 1,
+                index_version INT NOT NULL DEFAULT 1,
+                attempt_count INT NOT NULL DEFAULT 0,
                 created_at DATETIME(3) NOT NULL,
                 updated_at DATETIME(3) NOT NULL,
                 INDEX idx_tasks_status (status, updated_at),
                 INDEX idx_tasks_doc (doc_id),
+                INDEX idx_tasks_doc_version_status (doc_id, document_version, status, task_id),
                 CONSTRAINT fk_tasks_doc FOREIGN KEY (doc_id)
                     REFERENCES documents(doc_id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -178,6 +224,7 @@ class MySQLMetadataStore:
                 created_at DATETIME(3) NOT NULL,
                 UNIQUE KEY uq_document_versions_doc_version (doc_id, version),
                 INDEX idx_document_versions_doc_status (doc_id, status),
+                INDEX idx_document_versions_hash_status (content_hash, status, doc_id, version),
                 CONSTRAINT fk_document_versions_doc FOREIGN KEY (doc_id)
                     REFERENCES documents(doc_id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -224,8 +271,61 @@ class MySQLMetadataStore:
                 cur.close()
         for (table, column), ddl in _COLUMN_MIGRATIONS.items():
             self._ensure_column(table, column, ddl)
+        for (table, name), columns in _QUERY_INDEXES.items():
+            self._ensure_query_index(table, name, columns)
+        self._backfill_active_document_versions()
         self._ensure_document_chunks_shape()
         self._conn.commit()
+
+    def _backfill_active_document_versions(self):
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT IGNORE INTO document_versions
+                    (version_id, doc_id, version, content_hash, filename, file_type,
+                     storage_path, parser_version, parsed_artifact_path, status, created_at)
+                SELECT
+                    SHA2(CONCAT('legacy-active:', d.doc_id, ':', d.current_version), 256),
+                    d.doc_id,
+                    d.current_version,
+                    d.content_hash,
+                    d.filename,
+                    d.file_type,
+                    d.storage_path,
+                    d.parser_version,
+                    d.parsed_artifact_path,
+                    'active',
+                    COALESCE(d.created_at, NOW(3))
+                FROM documents d
+                LEFT JOIN document_versions dv
+                    ON dv.doc_id=d.doc_id AND dv.version=d.current_version
+                WHERE d.current_version > 0 AND dv.doc_id IS NULL
+                """
+            )
+            cur.execute(
+                """
+                UPDATE document_versions dv
+                INNER JOIN documents d
+                    ON d.doc_id=dv.doc_id AND d.current_version=dv.version
+                SET dv.content_hash=COALESCE(dv.content_hash, d.content_hash),
+                    dv.filename=COALESCE(dv.filename, d.filename),
+                    dv.file_type=COALESCE(dv.file_type, d.file_type),
+                    dv.storage_path=COALESCE(dv.storage_path, d.storage_path),
+                    dv.parser_version=COALESCE(dv.parser_version, d.parser_version),
+                    dv.parsed_artifact_path=COALESCE(dv.parsed_artifact_path, d.parsed_artifact_path)
+                WHERE d.current_version > 0
+                  AND (dv.content_hash IS NULL OR dv.filename IS NULL
+                       OR dv.file_type IS NULL OR dv.storage_path IS NULL
+                       OR dv.parser_version IS NULL OR dv.parsed_artifact_path IS NULL)
+                """
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     def _ensure_document_chunks_shape(self):
         row_id = self._get_column("document_chunks", "row_id")
@@ -533,6 +633,42 @@ class MySQLMetadataStore:
             if not present:
                 raise RuntimeError(f"duplicate column race did not produce expected column: {table}.{column}")
 
+    def _ensure_query_index(self, table: str, name: str, columns: tuple[str, ...]):
+        if _QUERY_INDEXES.get((table, name)) != columns:
+            raise ValueError("query index migration is not allowed")
+
+        def current_columns() -> tuple[str, ...]:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND INDEX_NAME=%s
+                    ORDER BY SEQ_IN_INDEX
+                    """,
+                    (table, name),
+                )
+                return tuple(row["COLUMN_NAME"] for row in cursor.fetchall())
+            finally:
+                cursor.close()
+
+        existing = current_columns()
+        if existing == columns:
+            return
+        if existing:
+            raise RuntimeError(f"unexpected query index shape: {table}.{name}")
+
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD INDEX {name} ({', '.join(columns)})")
+        except Exception as exc:
+            if not exc.args or exc.args[0] != 1061:
+                raise
+        finally:
+            cursor.close()
+        if current_columns() != columns:
+            raise RuntimeError(f"query index migration did not produce expected shape: {table}.{name}")
+
     @staticmethod
     def _dt(value: Any) -> str:
         if hasattr(value, "isoformat"):
@@ -568,7 +704,7 @@ class MySQLMetadataStore:
     def _doc_from_row(cls, row: dict | None) -> dict | None:
         if not row:
             return None
-        return {
+        document = {
             "id": row["doc_id"],
             "filename": row["filename"],
             "file_type": row.get("file_type") or "",
@@ -584,6 +720,10 @@ class MySQLMetadataStore:
             "created_at": cls._dt(row["created_at"]),
             "updated_at": cls._dt(row["updated_at"]),
         }
+        if row.get("hash_match_type"):
+            document["match_type"] = row["hash_match_type"]
+            document["match_task_id"] = row.get("hash_task_id")
+        return document
 
     @classmethod
     def _task_from_row(cls, row: dict | None) -> dict | None:
@@ -675,6 +815,14 @@ class MySQLMetadataStore:
         cur = None
         try:
             cur = conn.cursor()
+            self._lock_knowledge_base(cur, document["kb_id"])
+            duplicate = self._find_document_by_hash_with_cursor(
+                cur, document["kb_id"], document["content_hash"]
+            )
+            if duplicate:
+                raise DuplicateDocumentError(
+                    duplicate["id"], duplicate["match_type"], duplicate.get("match_task_id")
+                )
             cur.execute(
                 """
                 INSERT INTO documents
@@ -756,34 +904,89 @@ class MySQLMetadataStore:
         content_hash: str,
         exclude_document_id: str | None = None,
     ) -> dict | None:
+        sql, params = self._document_hash_query(kb_id, content_hash, exclude_document_id)
+        cur = self._execute(sql, params)
+        try:
+            return self._doc_from_row(cur.fetchone())
+        finally:
+            cur.close()
+
+    def _find_document_by_hash_with_cursor(
+        self,
+        cur,
+        kb_id: str,
+        content_hash: str,
+        exclude_document_id: str | None = None,
+    ) -> dict | None:
+        sql, params = self._document_hash_query(kb_id, content_hash, exclude_document_id)
+        cur.execute(sql, params)
+        return self._doc_from_row(cur.fetchone())
+
+    @staticmethod
+    def _document_hash_query(
+        kb_id: str,
+        content_hash: str,
+        exclude_document_id: str | None = None,
+    ) -> tuple[str, tuple[Any, ...]]:
         exclusion_sql = " AND d.doc_id<>%s" if exclude_document_id else ""
-        params = [kb_id]
+        params: list[Any] = [content_hash, content_hash, content_hash, kb_id]
         if exclude_document_id:
             params.append(exclude_document_id)
-        params.extend((content_hash, content_hash))
-        cur = self._execute(
+        params.extend((content_hash, content_hash, content_hash))
+        return (
             f"""
-            SELECT d.*
+            SELECT d.*,
+                   CASE
+                       WHEN d.current_version > 0 AND d.content_hash=%s THEN 'active'
+                       ELSE 'pending'
+                   END AS hash_match_type,
+                   CASE
+                       WHEN d.current_version > 0 AND d.content_hash=%s THEN NULL
+                       ELSE (
+                           SELECT MIN(dit2.task_id)
+                           FROM document_versions dv2
+                           INNER JOIN document_index_tasks dit2
+                               ON dit2.doc_id=dv2.doc_id
+                              AND dit2.document_version=dv2.version
+                           WHERE dv2.doc_id=d.doc_id
+                             AND dv2.content_hash=%s
+                             AND dv2.status='staging'
+                             AND dit2.status IN ('queued', 'parsing', 'chunking', 'indexing')
+                       )
+                   END AS hash_task_id
             FROM documents d
             WHERE d.kb_id=%s
               {exclusion_sql}
               AND d.status<>'deleting'
               AND (
-                  d.content_hash=%s
+                  (d.current_version > 0 AND d.content_hash=%s)
                   OR EXISTS (
-                      SELECT 1 FROM document_versions dv
+                      SELECT 1
+                      FROM document_versions dv
+                      INNER JOIN document_index_tasks dit
+                          ON dit.doc_id=dv.doc_id
+                         AND dit.document_version=dv.version
                       WHERE dv.doc_id=d.doc_id
                         AND dv.content_hash=%s
                         AND dv.status='staging'
+                        AND dit.status IN ('queued', 'parsing', 'chunking', 'indexing')
                   )
               )
+            ORDER BY CASE WHEN d.current_version > 0 AND d.content_hash=%s THEN 0 ELSE 1 END,
+                     d.created_at ASC, d.doc_id ASC
             LIMIT 1
             """,
             tuple(params),
         )
-        row = cur.fetchone()
-        cur.close()
-        return self._doc_from_row(row)
+
+    @staticmethod
+    def _lock_knowledge_base(cur, kb_id: str):
+        cur.execute(
+            "SELECT kb_id FROM knowledge_bases WHERE kb_id=%s FOR UPDATE",
+            (kb_id,),
+        )
+        if not cur.fetchone():
+            raise KnowledgeBaseNotFoundError(kb_id)
 
     def create_document_version_and_task(
         self,
@@ -800,19 +1003,32 @@ class MySQLMetadataStore:
         cur = None
         try:
             cur = conn.cursor()
+            self._lock_knowledge_base(cur, kb_id)
+            duplicate = self._find_document_by_hash_with_cursor(
+                cur, kb_id, content_hash, exclude_document_id=document_id
+            )
+            if duplicate:
+                raise DuplicateDocumentError(
+                    duplicate["id"], duplicate["match_type"], duplicate.get("match_task_id")
+                )
+            current_match = self._find_document_by_hash_with_cursor(cur, kb_id, content_hash)
+            if current_match and current_match["id"] == document_id:
+                raise DocumentContentUnchanged(document_id)
             cur.execute(
-                "SELECT doc_id, current_version, content_hash FROM documents "
+                "SELECT doc_id, current_version, content_hash, status FROM documents "
                 "WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
                 (document_id, kb_id),
             )
-            if not cur.fetchone():
-                raise ValueError("document does not exist")
+            document_row = cur.fetchone()
+            if not document_row or document_row.get("status") == "deleting":
+                raise DocumentNotFoundError(document_id)
             cur.execute(
                 "SELECT COALESCE(MAX(version), 0) AS max_version "
                 "FROM document_versions WHERE doc_id=%s",
                 (document_id,),
             )
-            new_version = int((cur.fetchone() or {}).get("max_version") or 0) + 1
+            max_version = int((cur.fetchone() or {}).get("max_version") or 0)
+            new_version = max(int(document_row.get("current_version") or 0), max_version) + 1
             cur.execute(
                 """
                 INSERT INTO document_versions
@@ -829,13 +1045,11 @@ class MySQLMetadataStore:
             cur.execute(
                 """
                 UPDATE documents
-                SET filename=%s, file_type=%s, status=%s, chunk_count=%s,
-                    task_id=%s, storage_path=%s, error_message=%s, updated_at=%s
+                SET status=%s, chunk_count=%s, task_id=%s, error_message=%s, updated_at=%s
                 WHERE doc_id=%s AND kb_id=%s
                 """,
                 (
-                    filename, file_type, "queued", 0, task_id, storage_path,
-                    None, self._mysql_dt(now), document_id, kb_id,
+                    "queued", 0, task_id, None, self._mysql_dt(now), document_id, kb_id,
                 ),
             )
             cur.execute(
@@ -852,6 +1066,363 @@ class MySQLMetadataStore:
             )
             conn.commit()
             return new_version
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def get_document_version(self, doc_id: str, version: int) -> dict | None:
+        cur = self._execute(
+            "SELECT * FROM document_versions WHERE doc_id=%s AND version=%s",
+            (doc_id, version),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else None
+
+    def update_document_version_status(self, doc_id: str, version: int, status: str):
+        cur = self._execute(
+            "UPDATE document_versions SET status=%s WHERE doc_id=%s AND version=%s AND status='staging'",
+            (status, doc_id, version),
+        )
+        cur.close()
+        self._conn.commit()
+
+    def complete_indexing_task(self, task_id: str, chunk_count: int) -> None:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                raise RuntimeError("indexing task is not in indexing state")
+            cur.execute(
+                "SELECT * FROM documents WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") != "indexing"
+            ):
+                raise RuntimeError("indexing task is not in indexing state")
+            if (
+                not document
+                or document.get("task_id") != task_id
+                or document.get("status") == "deleting"
+            ):
+                raise RuntimeError("indexing task no longer owns document")
+            version_number = int(task["document_version"])
+            cur.execute(
+                "SELECT * FROM document_versions "
+                "WHERE doc_id=%s AND version=%s AND status='staging' FOR UPDATE",
+                (task["doc_id"], version_number),
+            )
+            version = cur.fetchone()
+            if not version:
+                raise RuntimeError("staging document version does not exist")
+            cur.execute(
+                "UPDATE document_versions SET status='inactive' "
+                "WHERE doc_id=%s AND status='active' AND version<>%s",
+                (task["doc_id"], version_number),
+            )
+            cur.execute(
+                "UPDATE document_versions SET status='active' "
+                "WHERE doc_id=%s AND version=%s AND status='staging'",
+                (task["doc_id"], version_number),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("document version status changed during activation")
+            cur.execute(
+                """
+                UPDATE documents
+                SET filename=%s, file_type=%s, storage_path=%s, content_hash=%s,
+                    parser_version=%s, parsed_artifact_path=%s, current_version=%s,
+                    active_index_version=%s, status='ready', chunk_count=%s,
+                    error_message=NULL, updated_at=%s
+                WHERE doc_id=%s AND kb_id=%s AND task_id=%s AND status<>'deleting'
+                """,
+                (
+                    version.get("filename"), version.get("file_type"), version.get("storage_path"),
+                    version.get("content_hash"), version.get("parser_version"),
+                    version.get("parsed_artifact_path"), version_number,
+                    int(task.get("index_version") or 1), chunk_count, datetime.now(),
+                    task["doc_id"], task["kb_id"], task_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("document ownership changed during activation")
+            cur.execute(
+                """
+                UPDATE document_index_tasks
+                SET status='ready', error_message=NULL, updated_at=%s
+                WHERE task_id=%s AND doc_id=%s AND document_version=%s AND status='indexing'
+                """,
+                (datetime.now(), task_id, task["doc_id"], version_number),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("indexing task changed during activation")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def is_indexing_completion_committed(self, task_id: str) -> bool:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT 1 AS committed
+                FROM document_index_tasks dit
+                JOIN documents d
+                  ON d.doc_id=dit.doc_id AND d.kb_id=dit.kb_id
+                JOIN document_versions dv
+                  ON dv.doc_id=dit.doc_id AND dv.version=dit.document_version
+                WHERE dit.task_id=%s
+                  AND dit.status='ready'
+                  AND d.status='ready'
+                  AND d.task_id=dit.task_id
+                  AND d.current_version=dit.document_version
+                  AND dv.status='active'
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            committed = cur.fetchone() is not None
+            conn.commit()
+            return committed
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:
+                logger.warning(
+                    "MySQL rollback skipped after completion check error: %s", rollback_exc
+                )
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def finish_indexing_task(self, task_id: str, status: str, error_message: str) -> bool:
+        if status not in {"failed", "stale"}:
+            raise ValueError("terminal task status must be failed or stale")
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT * FROM documents WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+            ):
+                conn.commit()
+                return False
+            owns_document = bool(
+                document
+                and document.get("task_id") == task_id
+                and document.get("status") != "deleting"
+            )
+            cur.execute(
+                "SELECT * FROM document_versions WHERE doc_id=%s AND version=%s FOR UPDATE",
+                (task["doc_id"], task["document_version"]),
+            )
+            cur.fetchone()
+            cur.execute(
+                "UPDATE document_index_tasks SET status=%s, error_message=%s, updated_at=%s "
+                "WHERE task_id=%s AND status IN ('queued', 'parsing', 'chunking', 'indexing')",
+                (status, error_message, datetime.now(), task_id),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            cur.execute(
+                "UPDATE document_versions SET status=%s "
+                "WHERE doc_id=%s AND version=%s AND status='staging'",
+                (status, task["doc_id"], task["document_version"]),
+            )
+            if owns_document:
+                fallback = "ready" if int(document.get("current_version") or 0) > 0 else "failed"
+                cur.execute(
+                    "UPDATE documents SET status=%s, error_message=%s, updated_at=%s "
+                    "WHERE doc_id=%s AND task_id=%s AND status<>'deleting'",
+                    (fallback, error_message, datetime.now(), task["doc_id"], task_id),
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def requeue_indexing_task(self, task_id: str) -> bool:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT * FROM documents WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+            ):
+                conn.commit()
+                return False
+            if (
+                not document
+                or document.get("task_id") != task_id
+                or document.get("status") == "deleting"
+            ):
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT version FROM document_versions "
+                "WHERE doc_id=%s AND version=%s AND status='staging' FOR UPDATE",
+                (task["doc_id"], task["document_version"]),
+            )
+            if not cur.fetchone():
+                conn.commit()
+                return False
+            cur.execute(
+                "UPDATE document_index_tasks SET status='queued', error_message=NULL, updated_at=%s "
+                "WHERE task_id=%s",
+                (datetime.now(), task_id),
+            )
+            cur.execute(
+                "UPDATE documents SET status='queued', error_message=NULL, updated_at=%s "
+                "WHERE doc_id=%s AND task_id=%s AND status<>'deleting'",
+                (datetime.now(), task["doc_id"], task_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("document ownership changed during recovery")
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def set_indexing_phase(self, task_id: str, phase: str) -> bool:
+        if phase not in {"parsing", "indexing"}:
+            raise ValueError("indexing phase must be parsing or indexing")
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT doc_id, task_id, status FROM documents "
+                "WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") != "parsing"
+            ):
+                conn.commit()
+                return False
+            if (
+                not document
+                or document.get("task_id") != task_id
+                or document.get("status") == "deleting"
+            ):
+                conn.commit()
+                return False
+            if phase == "indexing":
+                cur.execute(
+                    "UPDATE document_index_tasks SET status='indexing', updated_at=%s "
+                    "WHERE task_id=%s AND status='parsing'",
+                    (datetime.now(), task_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("indexing task changed during phase transition")
+            cur.execute(
+                "UPDATE documents SET status=%s, error_message=NULL, updated_at=%s "
+                "WHERE doc_id=%s AND task_id=%s AND status<>'deleting'",
+                (phase, datetime.now(), task["doc_id"], task_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("document ownership changed during phase transition")
+            conn.commit()
+            return True
         except Exception:
             conn.rollback()
             raise
