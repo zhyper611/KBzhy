@@ -22,9 +22,17 @@ from KBzhy.config import (
     READ_TIMEOUT,
     MAX_CONTEXT_TOKENS,
     CHROMA_PERSIST_DIR,
+    TOP_K,
 )
 from KBzhy.app.core.parser import DocumentParser
-from KBzhy.app.core.document_models import KnowledgeChunk, ParsedDocument
+from KBzhy.app.core.document_models import (
+    KnowledgeChunk,
+    ParsedDocument,
+    RetrievalCandidate,
+)
+from KBzhy.app.core.chunk_repository import ChunkRepository
+from KBzhy.app.core.context_assembler import ContextAssembler
+from KBzhy.app.core.metadata_store import get_metadata_store
 from KBzhy.app.core.splitter import SmartSplitter, StructuralChunker
 from KBzhy.app.core.retriever import Retriever, _http_client
 from KBzhy.app.core.memory import MemoryManager
@@ -76,16 +84,23 @@ class RAGEngine:
         persist_dir: str | None = None,
         llm_model: str | None = None,
         embedding_model: str | None = None,
+        parser=None,
+        splitter=None,
+        structural_chunker=None,
+        repository=None,
+        retriever=None,
+        context_assembler=None,
     ):
         self.persist_dir = persist_dir or CHROMA_PERSIST_DIR
         self.llm_model = llm_model or LLM_MODEL
-        self.parser = DocumentParser(vlm_model=self.llm_model)
-        self.splitter = SmartSplitter()
-        self.structural_chunker = StructuralChunker()
-        self.retriever = Retriever(
-            persist_dir=self.persist_dir,
-            embedding_model=embedding_model,
+        self.parser = parser or DocumentParser(vlm_model=self.llm_model)
+        self.splitter = splitter or SmartSplitter()
+        self.structural_chunker = structural_chunker or StructuralChunker()
+        self.repository = repository or ChunkRepository(get_metadata_store())
+        self.retriever = retriever or Retriever(
+            persist_dir=self.persist_dir, embedding_model=embedding_model
         )
+        self.context_assembler = context_assembler or ContextAssembler(self.repository)
         self.memory_manager = MemoryManager()
 
     # ── LLM 调用 ────────────────────────────────
@@ -408,12 +423,20 @@ class RAGEngine:
                 memory.add_message("assistant", answer, sources=[])
             return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
 
+        context_units = self._assemble_retrieval_context(results, top_k)
+        if not context_units:
+            answer = KNOWLEDGE_QA_REFUSAL
+            if memory:
+                memory.add_message("user", question)
+                memory.add_message("assistant", answer, sources=[])
+            return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
+
         if chain_type == "map_reduce":
-            answer = self._generate_map_reduce(question, results, temp)
+            answer = self._generate_map_reduce(question, context_units, temp)
         elif chain_type == "refine":
-            answer = self._generate_refine(question, results, temp)
+            answer = self._generate_refine(question, context_units, temp)
         else:
-            messages = self._build_messages(question, results, memory)
+            messages = self._build_messages(question, context_units, memory)
             with timed_stage(logger, "llm_generate_sync", request_id=request_id, model=self.llm_model):
                 answer = self._call_llm_sync(messages, temp)
 
@@ -494,7 +517,18 @@ class RAGEngine:
             yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
             return
 
-        messages = self._build_messages(question, results, memory)
+        context_units = self._assemble_retrieval_context(results, top_k)
+        if not context_units:
+            yield '[STATUS]{"stage":"generate","message":"姝ｅ湪鐢熸垚鍥炵瓟..."}'
+            full_text = KNOWLEDGE_QA_REFUSAL
+            yield full_text
+            if memory:
+                memory.add_message("user", question)
+                memory.add_message("assistant", full_text, sources=[])
+            yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
+            return
+
+        messages = self._build_messages(question, context_units, memory)
 
         yield '[STATUS]{"stage":"generate","message":"正在生成回答..."}'
 
@@ -670,6 +704,26 @@ class RAGEngine:
         return _WindowManager(self, messages)
 
     # ── 消息构建 ────────────────────────────────
+
+    def _assemble_retrieval_context(self, results, top_k: int | None):
+        assembler = getattr(self, "context_assembler", None)
+        if assembler is None:
+            return results
+        candidates = []
+        for index, result in enumerate(results):
+            if isinstance(result, RetrievalCandidate):
+                candidates.append(result)
+                continue
+            metadata = dict(result.get("metadata") or {})
+            candidates.append(
+                RetrievalCandidate(
+                    chunk_id=str(metadata.get("chunk_id") or f"legacy-{index}"),
+                    content=result["content"],
+                    metadata=metadata,
+                    rerank_score=float(result.get("score", 0.0)),
+                )
+            )
+        return assembler.assemble(candidates, final_k=top_k or TOP_K)
 
     def _build_messages(
         self,

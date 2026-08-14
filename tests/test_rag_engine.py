@@ -7,6 +7,8 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from KBzhy.app.api import chat
+from KBzhy.app.core.context_assembler import ContextUnit
+from KBzhy.app.core.document_models import RetrievalCandidate
 from KBzhy.app.core.rag_engine import KNOWLEDGE_QA_REFUSAL, KNOWLEDGE_QA_SYSTEM_PROMPT, RAGEngine
 
 
@@ -47,6 +49,56 @@ class FixedRetriever:
                 "score": 0.9,
             }
         ]
+
+
+def test_chat_generates_from_assembled_context_but_sources_remain_original_hits():
+    hit = RetrievalCandidate(
+        chunk_id="hit-1",
+        content="short child hit",
+        metadata={"doc_id": "doc-1", "source": "policy.md", "page": 2},
+        rerank_score=0.9,
+    )
+
+    class Retriever:
+        def retrieve(self, *args, **kwargs):
+            return [hit]
+
+    parent = ContextUnit(
+        chunk_id="parent-1",
+        document_id="doc-1",
+        content="expanded parent context",
+        metadata={"source": "policy.md"},
+        context_role="parent",
+        origin_chunk_id="hit-1",
+    )
+
+    class Assembler:
+        def assemble(self, candidates, final_k):
+            assert candidates == [hit]
+            return [parent]
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.memory_manager = FakeMemoryManager(None)
+    engine.retriever = Retriever()
+    engine.context_assembler = Assembler()
+    engine.llm_model = "test-model"
+    captured = {}
+
+    def generate(messages, temperature):
+        captured["messages"] = messages
+        return "answer"
+
+    engine._call_llm_sync = generate
+    engine._manage_context_window = lambda messages: nullcontext()
+
+    result = engine.chat(
+        question="question", kb_id="kb1", top_k=5,
+        enable_expansion=False, enable_rewrite=False,
+    )
+
+    assert "expanded parent context" in captured["messages"][0]["content"]
+    assert "short child hit" not in captured["messages"][0]["content"]
+    assert [source["content"] for source in result["sources"]] == ["short child hit"]
 
 
 def test_chat_records_refusal_in_session_memory():

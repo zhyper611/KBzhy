@@ -30,6 +30,21 @@ class ContextUnit:
     parent_chunk_id: str | None = None
     position: int | None = None
 
+    def __getitem__(self, key: str):
+        if key == "content":
+            return self.content
+        if key == "metadata":
+            return self.metadata
+        if key == "score":
+            return self.rerank_score or 0.0
+        raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
 
 class ContextAssembler:
     def __init__(
