@@ -53,6 +53,11 @@ FETCH_K = 15  # MMR 候选数
 SIMILARITY_THRESHOLD = 0.35  # 低于此值拒答
 BM25_WEIGHT = 0.3  # BM25 权重
 VECTOR_WEIGHT = 0.7  # 向量权重
+VECTOR_FETCH_K = int(os.getenv("VECTOR_FETCH_K", "30"))
+BM25_FETCH_K = int(os.getenv("BM25_FETCH_K", "30"))
+RRF_K = int(os.getenv("RRF_K", "60"))
+RRF_CANDIDATE_K = int(os.getenv("RRF_CANDIDATE_K", "40"))
+RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", "30"))
 
 # ====== 对话参数 ======
 MAX_CONTEXT_ROUNDS = 10  # Redis 热层保留最近 N 轮

@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from KBzhy.app.core.document_models import KnowledgeChunk
-from KBzhy.app.core.retriever import Retriever
+from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate
+from KBzhy.app.core.retriever import Retriever, rrf_fuse
 from KBzhy.app.core.splitter import Chunk
 
 
@@ -60,6 +60,75 @@ def make_knowledge_chunk(chunk_id, *, chunk_type="child", version=2, position=0)
         index_version=1,
         metadata={"source": "policy.md"},
     )
+
+
+def make_candidate(chunk_id, raw_score=0.0):
+    return RetrievalCandidate(
+        chunk_id=chunk_id,
+        content=f"content-{chunk_id}",
+        metadata={"chunk_id": chunk_id},
+        vector_score=raw_score,
+        bm25_score=raw_score,
+    )
+
+
+def test_rrf_merges_same_chunk_by_stable_id():
+    fused = rrf_fuse(
+        [make_candidate("a"), make_candidate("b")],
+        [make_candidate("b"), make_candidate("c")],
+        k=60,
+    )
+
+    assert fused[0].chunk_id == "b"
+    assert fused[0].vector_rank == 2
+    assert fused[0].bm25_rank == 1
+
+
+def test_rrf_uses_rank_instead_of_raw_score_scale():
+    fused = rrf_fuse(
+        [make_candidate("low", 0.01), make_candidate("high", 9999)], [], k=60
+    )
+
+    assert [item.chunk_id for item in fused] == ["low", "high"]
+
+
+def test_hybrid_search_fetches_each_route_independently_and_filters_before_rrf():
+    retriever = Retriever.__new__(Retriever)
+    retriever.vector_fetch_k = 30
+    retriever.bm25_fetch_k = 25
+    retriever.rrf_k = 60
+    retriever.rrf_candidate_k = 40
+    calls = []
+    retriever._vector_search = lambda query, kb_id, k: calls.append(("vector", k)) or [
+        ("old", {"chunk_id": "old", "doc_id": "doc-1", "document_version": 1}, 0.99)
+    ]
+    retriever._bm25_search = lambda query, kb_id, k: calls.append(("bm25", k)) or [
+        ("new", {"chunk_id": "new", "doc_id": "doc-1", "document_version": 2}, 0.01)
+    ]
+    retriever._active_version_resolver = lambda doc_ids: {"doc-1": 2}
+
+    result = retriever._hybrid_search("query", "kb1", 5)
+
+    assert sorted(calls) == [("bm25", 25), ("vector", 30)]
+    assert [item.chunk_id for item in result] == ["new"]
+    assert result[0].bm25_rank == 1
+
+
+def test_hybrid_search_uses_surviving_route_when_other_route_raises():
+    retriever = Retriever.__new__(Retriever)
+    retriever.vector_fetch_k = 30
+    retriever.bm25_fetch_k = 30
+    retriever.rrf_k = 60
+    retriever.rrf_candidate_k = 40
+    retriever._vector_search = lambda *_args: (_ for _ in ()).throw(RuntimeError("down"))
+    retriever._bm25_search = lambda *_args: [
+        ("text", {"chunk_id": "child-1"}, 0.5)
+    ]
+    retriever._active_version_resolver = lambda doc_ids: {}
+
+    result = retriever._hybrid_search("query", "kb1", 5)
+
+    assert [item.chunk_id for item in result] == ["child-1"]
 
 
 def test_stage_document_children_uses_stable_ids_and_only_indexes_children():

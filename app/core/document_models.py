@@ -124,3 +124,25 @@ class KnowledgeChunk:
             index_version=index_version,
             metadata=dict(metadata) if metadata is not None else {},
         )
+
+
+@dataclass(frozen=True)
+class RetrievalCandidate:
+    __hash__ = None
+
+    chunk_id: str
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    vector_rank: int | None = None
+    vector_score: float | None = None
+    bm25_rank: int | None = None
+    bm25_score: float | None = None
+    rrf_score: float = 0.0
+    rerank_score: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", deepcopy(self.metadata))
+
+    @property
+    def score(self) -> float:
+        return self.rerank_score if self.rerank_score is not None else self.rrf_score

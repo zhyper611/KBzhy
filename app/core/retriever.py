@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from itertools import zip_longest
 from typing import Any
 
@@ -29,11 +31,15 @@ from KBzhy.config import (
     SIMILARITY_THRESHOLD,
     BM25_WEIGHT,
     VECTOR_WEIGHT,
+    VECTOR_FETCH_K,
+    BM25_FETCH_K,
+    RRF_K,
+    RRF_CANDIDATE_K,
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
     CHROMA_PERSIST_DIR,
 )
-from KBzhy.app.core.document_models import KnowledgeChunk
+from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate
 from KBzhy.app.core.splitter import Chunk
 from KBzhy.app.core.timing import timed_stage
 
@@ -42,6 +48,51 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 _KB_COLLECTION_PREFIX = "kbzhy_"
 _EMBEDDING_BATCH_SIZE = 10
+
+
+def rrf_fuse(
+    vector_candidates: list[RetrievalCandidate],
+    bm25_candidates: list[RetrievalCandidate],
+    *,
+    k: int = RRF_K,
+    limit: int | None = None,
+) -> list[RetrievalCandidate]:
+    if k <= 0:
+        raise ValueError("rrf k must be positive")
+    fused: dict[str, RetrievalCandidate] = {}
+    first_seen: dict[str, int] = {}
+    sequence = 0
+    for channel, candidates in (("vector", vector_candidates), ("bm25", bm25_candidates)):
+        seen_in_channel = set()
+        for rank, candidate in enumerate(candidates, start=1):
+            if candidate.chunk_id in seen_in_channel:
+                continue
+            seen_in_channel.add(candidate.chunk_id)
+            if candidate.chunk_id not in first_seen:
+                first_seen[candidate.chunk_id] = sequence
+                sequence += 1
+            existing = fused.get(candidate.chunk_id, candidate)
+            score = existing.rrf_score + 1.0 / (k + rank)
+            if channel == "vector":
+                existing = replace(
+                    existing,
+                    vector_rank=rank,
+                    vector_score=candidate.vector_score,
+                    rrf_score=score,
+                )
+            else:
+                existing = replace(
+                    existing,
+                    bm25_rank=rank,
+                    bm25_score=candidate.bm25_score,
+                    rrf_score=score,
+                )
+            fused[candidate.chunk_id] = existing
+    ranked = sorted(
+        fused.values(),
+        key=lambda item: (-item.rrf_score, first_seen[item.chunk_id], item.chunk_id),
+    )
+    return ranked[:limit] if limit is not None else ranked
 
 # 共享 httpx 客户端：禁用 HTTP/2 避免 SSL EOF 错误
 _http_client = httpx.Client(
@@ -77,11 +128,19 @@ class Retriever:
         top_k: int = TOP_K,
         fetch_k: int = FETCH_K,
         threshold: float = SIMILARITY_THRESHOLD,
+        vector_fetch_k: int = VECTOR_FETCH_K,
+        bm25_fetch_k: int = BM25_FETCH_K,
+        rrf_k: int = RRF_K,
+        rrf_candidate_k: int = RRF_CANDIDATE_K,
     ):
         self.persist_dir = persist_dir or CHROMA_PERSIST_DIR
         self.top_k = top_k
         self.fetch_k = fetch_k
         self.threshold = threshold
+        self.vector_fetch_k = vector_fetch_k
+        self.bm25_fetch_k = bm25_fetch_k
+        self.rrf_k = rrf_k
+        self.rrf_candidate_k = rrf_candidate_k
         self._lock = threading.Lock()
 
         emb_model = embedding_model or EMBEDDING_MODEL
@@ -510,8 +569,15 @@ class Retriever:
         with timed_stage(logger, "hybrid_search_all", request_id=request_id, query_count=len(queries)):
             for q in queries:
                 candidates = self._hybrid_search(q, kb_id, tk, request_id=request_id)
-                for content, meta, score in candidates:
-                    key = content[:100]
+                for candidate in candidates:
+                    if isinstance(candidate, RetrievalCandidate):
+                        content = candidate.content
+                        meta = candidate.metadata
+                        score = candidate.rrf_score
+                        key = candidate.chunk_id
+                    else:
+                        content, meta, score = candidate
+                        key = str(meta.get("chunk_id") or content[:100])
                     if key not in seen:
                         seen.add(key)
                         all_candidates.append((content, meta, score))
@@ -519,16 +585,11 @@ class Retriever:
         if not all_candidates:
             return []
 
-        filtered = [(c, m, s) for c, m, s in all_candidates if s >= th]
-        if not filtered:
-            logger.info("所有结果低于阈值 %.3f，触发拒答", th)
-            return []
-
         if on_status:
             on_status("rerank", "正在重排序结果...")
 
-        with timed_stage(logger, "mmr", request_id=request_id, candidates=len(filtered), top_k=tk):
-            mmr_results = self._mmr(query, filtered, tk)
+        with timed_stage(logger, "mmr", request_id=request_id, candidates=len(all_candidates), top_k=tk):
+            mmr_results = self._mmr(query, all_candidates, tk)
         with timed_stage(logger, "rerank", request_id=request_id, method=rerank_method, candidates=len(mmr_results)):
             final = self._rerank(query, mmr_results, rerank_method)
         final_filtered = [item for item in final if item.get("score", 0) >= th]
@@ -539,14 +600,34 @@ class Retriever:
 
     # ── 混合检索 ────────────────────────────────
 
-    def _hybrid_search(self, query: str, kb_id: str, top_k: int, request_id: str | None = None) -> list[tuple[str, dict, float]]:
-        """BM25 + 向量检索加权融合"""
-        fetch = max(top_k * 3, self.fetch_k)
+    def _hybrid_search(self, query: str, kb_id: str, top_k: int, request_id: str | None = None) -> list[RetrievalCandidate]:
+        searches = {
+            "vector": (self._vector_search, self.vector_fetch_k),
+            "bm25": (self._bm25_search, self.bm25_fetch_k),
+        }
+        results: dict[str, list[tuple[str, dict, float]]] = {"vector": [], "bm25": []}
 
-        with timed_stage(logger, "vector_search", request_id=request_id, kb_id=kb_id, k=fetch):
-            vec_results = self._vector_search(query, kb_id, fetch)
-        with timed_stage(logger, "bm25_search", request_id=request_id, kb_id=kb_id, k=fetch):
-            bm25_results = self._bm25_search(query, kb_id, fetch)
+        def run_route(channel, search, fetch_k):
+            with timed_stage(
+                logger, f"{channel}_search", request_id=request_id,
+                kb_id=kb_id, k=fetch_k,
+            ):
+                return search(query, kb_id, fetch_k)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(run_route, channel, search, fetch_k): channel
+                for channel, (search, fetch_k) in searches.items()
+            }
+            for future in as_completed(futures):
+                channel = futures[future]
+                try:
+                    results[channel] = future.result()
+                except Exception as exc:
+                    logger.error("%s retrieval route failed: %s", channel, exc)
+
+        vec_results = results["vector"]
+        bm25_results = results["bm25"]
 
         versioned_candidates = vec_results + bm25_results
         doc_ids = {
@@ -564,19 +645,42 @@ class Retriever:
         vec_results = self._filter_active_candidates(vec_results, active_versions)
         bm25_results = self._filter_active_candidates(bm25_results, active_versions)
 
-        combined: dict[str, tuple[str, dict, float]] = {}
-        for content, meta, score in vec_results:
-            combined[content[:200]] = (content, meta, score * VECTOR_WEIGHT)
-        for content, meta, score in bm25_results:
-            key = content[:200]
-            if key in combined:
-                _, m, s = combined[key]
-                combined[key] = (content, m, s + score * BM25_WEIGHT)
-            else:
-                combined[key] = (content, meta, score * BM25_WEIGHT)
+        vector_candidates = [
+            self._candidate_from_result(content, metadata, vector_score=score)
+            for content, metadata, score in vec_results
+        ]
+        bm25_candidates = [
+            self._candidate_from_result(content, metadata, bm25_score=score)
+            for content, metadata, score in bm25_results
+        ]
+        return rrf_fuse(
+            vector_candidates,
+            bm25_candidates,
+            k=self.rrf_k,
+            limit=self.rrf_candidate_k,
+        )
 
-        ranked = sorted(combined.values(), key=lambda x: x[2], reverse=True)
-        return ranked[:fetch]
+    @staticmethod
+    def _candidate_from_result(
+        content: str,
+        metadata: dict,
+        *,
+        vector_score: float | None = None,
+        bm25_score: float | None = None,
+    ) -> RetrievalCandidate:
+        chunk_id = metadata.get("chunk_id")
+        if not chunk_id:
+            identity = json.dumps(
+                [content, metadata], ensure_ascii=False, sort_keys=True, default=str
+            )
+            chunk_id = f"legacy-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+        return RetrievalCandidate(
+            chunk_id=str(chunk_id),
+            content=content,
+            metadata=metadata,
+            vector_score=vector_score,
+            bm25_score=bm25_score,
+        )
 
     def _filter_active_candidates(
         self,
