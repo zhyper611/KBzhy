@@ -35,11 +35,18 @@ from KBzhy.config import (
     BM25_FETCH_K,
     RRF_K,
     RRF_CANDIDATE_K,
+    RERANK_CANDIDATE_K,
+    MODEL_RERANK_THRESHOLD,
+    KEYWORD_RERANK_THRESHOLD,
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
     CHROMA_PERSIST_DIR,
 )
-from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate
+from KBzhy.app.core.document_models import (
+    KnowledgeChunk,
+    RetrievalCandidate,
+    RerankResult,
+)
 from KBzhy.app.core.splitter import Chunk
 from KBzhy.app.core.timing import timed_stage
 
@@ -132,6 +139,9 @@ class Retriever:
         bm25_fetch_k: int = BM25_FETCH_K,
         rrf_k: int = RRF_K,
         rrf_candidate_k: int = RRF_CANDIDATE_K,
+        rerank_candidate_k: int = RERANK_CANDIDATE_K,
+        model_rerank_threshold: float = MODEL_RERANK_THRESHOLD,
+        keyword_rerank_threshold: float = KEYWORD_RERANK_THRESHOLD,
     ):
         self.persist_dir = persist_dir or CHROMA_PERSIST_DIR
         self.top_k = top_k
@@ -141,6 +151,9 @@ class Retriever:
         self.bm25_fetch_k = bm25_fetch_k
         self.rrf_k = rrf_k
         self.rrf_candidate_k = rrf_candidate_k
+        self.rerank_candidate_k = rerank_candidate_k
+        self.model_rerank_threshold = model_rerank_threshold
+        self.keyword_rerank_threshold = keyword_rerank_threshold
         self._lock = threading.Lock()
 
         emb_model = embedding_model or EMBEDDING_MODEL
@@ -538,9 +551,8 @@ class Retriever:
         threshold: float | None,
         on_status: callable = None,
         request_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[RetrievalCandidate]:
         tk = top_k or self.top_k
-        th = threshold if threshold is not None else self.threshold
 
         queries = [query]
         if enable_expansion:
@@ -564,23 +576,19 @@ class Retriever:
         if on_status:
             on_status("retrieve", "正在检索相关知识...")
 
-        all_candidates: list[tuple[str, dict, float]] = []
-        seen = set()
+        all_candidates: dict[str, RetrievalCandidate] = {}
         with timed_stage(logger, "hybrid_search_all", request_id=request_id, query_count=len(queries)):
             for q in queries:
                 candidates = self._hybrid_search(q, kb_id, tk, request_id=request_id)
                 for candidate in candidates:
-                    if isinstance(candidate, RetrievalCandidate):
-                        content = candidate.content
-                        meta = candidate.metadata
-                        score = candidate.rrf_score
-                        key = candidate.chunk_id
-                    else:
+                    if not isinstance(candidate, RetrievalCandidate):
                         content, meta, score = candidate
-                        key = str(meta.get("chunk_id") or content[:100])
-                    if key not in seen:
-                        seen.add(key)
-                        all_candidates.append((content, meta, score))
+                        candidate = replace(
+                            self._candidate_from_result(content, meta), rrf_score=score
+                        )
+                    existing = all_candidates.get(candidate.chunk_id)
+                    if existing is None or candidate.rrf_score > existing.rrf_score:
+                        all_candidates[candidate.chunk_id] = candidate
 
         if not all_candidates:
             return []
@@ -588,13 +596,22 @@ class Retriever:
         if on_status:
             on_status("rerank", "正在重排序结果...")
 
-        with timed_stage(logger, "mmr", request_id=request_id, candidates=len(all_candidates), top_k=tk):
-            mmr_results = self._mmr(query, all_candidates, tk)
-        with timed_stage(logger, "rerank", request_id=request_id, method=rerank_method, candidates=len(mmr_results)):
-            final = self._rerank(query, mmr_results, rerank_method)
-        final_filtered = [item for item in final if item.get("score", 0) >= th]
+        rerank_input = sorted(
+            all_candidates.values(), key=lambda item: item.rrf_score, reverse=True
+        )[:self.rerank_candidate_k]
+        with timed_stage(logger, "rerank", request_id=request_id, method=rerank_method, candidates=len(rerank_input)):
+            rerank_result = self._rerank(query, rerank_input, rerank_method)
+        if rerank_result.method in {"model", "llm"}:
+            applied_threshold = (
+                threshold if threshold is not None else self.model_rerank_threshold
+            )
+        else:
+            applied_threshold = self.keyword_rerank_threshold
+        final_filtered = [
+            item for item in rerank_result.items if item.score >= applied_threshold
+        ]
         if not final_filtered:
-            logger.info("重排后所有结果低于阈值 %.3f，触发拒答", th)
+            logger.info("all reranked results were below threshold %.3f", applied_threshold)
             return []
         return final_filtered
 
@@ -842,34 +859,36 @@ class Retriever:
     def _rerank(
         self,
         query: str,
-        candidates: list[dict[str, Any]],
+        candidates: list[RetrievalCandidate],
         method: str,
-    ) -> list[dict[str, Any]]:
+    ) -> RerankResult:
         """重排序：按选定方法执行，失败回退到关键词评分"""
         if not candidates:
-            return []
+            return RerankResult((), method, False)
 
         if method == "model":
             if time.time() - Retriever._model_rerank_failed_at > 60:
                 results = self._rerank_model(query, candidates)
                 if results:
-                    return results
+                    return RerankResult(tuple(results), "model", True)
                 Retriever._model_rerank_failed_at = time.time()
                 logger.info("Reranker 模型不可用，60s 内回退到关键词评分")
-            return self._rerank_keyword(query, candidates)
+            return RerankResult(tuple(self._rerank_keyword(query, candidates)), "keyword", False)
 
         if method == "llm":
             try:
-                return self._rerank_llm(query, candidates)
+                return RerankResult(tuple(self._rerank_llm(query, candidates)), "llm", True)
             except Exception:
                 logger.info("LLM 打分失败，回退到关键词评分")
 
-        return self._rerank_keyword(query, candidates)
+        return RerankResult(tuple(self._rerank_keyword(query, candidates)), "keyword", False)
 
-    def _rerank_model(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rerank_model(
+        self, query: str, candidates: list[RetrievalCandidate]
+    ) -> list[RetrievalCandidate]:
         """调用专用 Reranker 模型（DashScope 原生 API）"""
 
-        docs = [c["content"] for c in candidates]
+        docs = [candidate.content for candidate in candidates]
         url = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
         try:
             resp = _http_client.post(
@@ -899,22 +918,26 @@ class Retriever:
         if not results:
             return []
 
+        scored = list(candidates)
         for r in results:
             idx = r.get("index", -1)
             score = r.get("relevance_score", 0.0)
             if 0 <= idx < len(candidates):
-                candidates[idx]["score"] = float(score)
+                scored[idx] = replace(candidates[idx], rerank_score=float(score))
 
-        return sorted(candidates, key=lambda x: x["score"], reverse=True)
+        return sorted(scored, key=lambda item: item.score, reverse=True)
 
-    def _rerank_llm(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rerank_llm(
+        self, query: str, candidates: list[RetrievalCandidate]
+    ) -> list[RetrievalCandidate]:
         """LLM 逐条打分"""
 
+        scored = []
         for item in candidates:
             prompt = (
                 f"评估以下文档与问题的相关性，只返回0-10的整数分数。\n"
                 f"问题：{query}\n"
-                f"文档：{item['content'][:500]}"
+                f"文档：{item.content[:500]}"
             )
             try:
                 resp = _http_client.post(
@@ -933,24 +956,28 @@ class Retriever:
                 data = resp.json()
                 text = data["choices"][0]["message"]["content"]
                 numbers = re.findall(r"\d+", text)
-                item["score"] = min(int(numbers[0]), 10) / 10.0 if numbers else 0.5
+                score = min(int(numbers[0]), 10) / 10.0 if numbers else 0.5
             except Exception:
-                if "score" not in item or item["score"] == 0.0:
-                    item["score"] = 0.5
+                score = 0.5
+            scored.append(replace(item, rerank_score=score))
 
-        return sorted(candidates, key=lambda x: x["score"], reverse=True)
+        return sorted(scored, key=lambda item: item.score, reverse=True)
 
-    def _rerank_keyword(self, query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rerank_keyword(
+        self, query: str, candidates: list[RetrievalCandidate]
+    ) -> list[RetrievalCandidate]:
         """关键词覆盖率评分"""
         import jieba
         stop = {"", " ", "？", "?", "，", "。", "的", "了", "是", "在", "有", "和"}
         query_words = set(jieba.cut(query)) - stop
 
+        scored = []
         for item in candidates:
-            hits = sum(1 for w in query_words if w in item["content"])
-            item["score"] = hits / max(len(query_words), 1)
+            hits = sum(1 for word in query_words if word in item.content)
+            score = hits / max(len(query_words), 1)
+            scored.append(replace(item, rerank_score=score))
 
-        return sorted(candidates, key=lambda x: x["score"], reverse=True)
+        return sorted(scored, key=lambda item: item.score, reverse=True)
 
     # ── 查询扩展 ──────────────────────────────
 

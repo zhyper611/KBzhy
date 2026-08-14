@@ -146,3 +146,28 @@ class RetrievalCandidate:
     @property
     def score(self) -> float:
         return self.rerank_score if self.rerank_score is not None else self.rrf_score
+
+    def __getitem__(self, key: str):
+        if key == "content":
+            return self.content
+        if key == "metadata":
+            return self.metadata
+        if key == "score":
+            return self.score
+        raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+@dataclass(frozen=True)
+class RerankResult:
+    items: tuple[RetrievalCandidate, ...]
+    method: str
+    threshold_applied: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "items", tuple(self.items))

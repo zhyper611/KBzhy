@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 import pytest
 
-from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate
+from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate, RerankResult
 from KBzhy.app.core.retriever import Retriever, rrf_fuse
 from KBzhy.app.core.splitter import Chunk
 
@@ -62,13 +63,14 @@ def make_knowledge_chunk(chunk_id, *, chunk_type="child", version=2, position=0)
     )
 
 
-def make_candidate(chunk_id, raw_score=0.0):
+def make_candidate(chunk_id, raw_score=0.0, rrf_score=0.0):
     return RetrievalCandidate(
         chunk_id=chunk_id,
         content=f"content-{chunk_id}",
         metadata={"chunk_id": chunk_id},
         vector_score=raw_score,
         bm25_score=raw_score,
+        rrf_score=rrf_score,
     )
 
 
@@ -300,20 +302,20 @@ def test_retrieve_filters_scores_after_rerank():
     retriever = Retriever.__new__(Retriever)
     retriever.top_k = 2
     retriever.threshold = 0.35
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = 0.0
     retriever._is_complex = lambda query: False
     retriever._hybrid_search = lambda query, kb_id, top_k, request_id=None: [
         ("high after rerank", {"source": "a.md"}, 0.95),
         ("low after rerank", {"source": "b.md"}, 0.92),
     ]
-    retriever._mmr = lambda query, candidates, top_k: [
-        {"content": content, "metadata": metadata, "score": score}
-        for content, metadata, score in candidates
-    ]
-
     def fake_rerank(query, candidates, method):
-        candidates[0]["score"] = 0.8
-        candidates[1]["score"] = 0.2
-        return candidates
+        return RerankResult(
+            (replace(candidates[0], rerank_score=0.8), replace(candidates[1], rerank_score=0.2)),
+            "model",
+            True,
+        )
 
     retriever._rerank = fake_rerank
 
@@ -328,6 +330,68 @@ def test_retrieve_filters_scores_after_rerank():
     )
 
     assert [item["content"] for item in results] == ["high after rerank"]
+
+
+def test_retrieve_sends_wide_rrf_candidate_set_to_reranker():
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.0
+    retriever.keyword_rerank_threshold = 0.0
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [
+        make_candidate(f"c-{index}", rrf_score=1 - index / 100)
+        for index in range(40)
+    ]
+    received = []
+
+    def fake_rerank(query, candidates, method):
+        received.extend(candidates)
+        return RerankResult(tuple(candidates), "keyword", False)
+
+    retriever._rerank = fake_rerank
+
+    retriever.retrieve(
+        "query", "kb1", enable_expansion=False, enable_decomposition=False
+    )
+
+    assert len(received) == 30
+
+
+def test_keyword_fallback_does_not_use_request_model_threshold():
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = 0.0
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [make_candidate("a", rrf_score=0.1)]
+    retriever._rerank = lambda query, candidates, method: RerankResult(
+        (replace(candidates[0], rerank_score=0.0),), "keyword", False
+    )
+
+    result = retriever.retrieve(
+        "query", "kb1", threshold=0.99,
+        enable_expansion=False, enable_decomposition=False,
+    )
+
+    assert [item.chunk_id for item in result] == ["a"]
+
+
+def test_model_failure_with_no_keyword_signal_preserves_rrf_order():
+    retriever = Retriever.__new__(Retriever)
+    retriever._rerank_model = lambda query, candidates: []
+    Retriever._model_rerank_failed_at = 0.0
+    candidates = [
+        make_candidate("first", rrf_score=0.3),
+        make_candidate("second", rrf_score=0.2),
+        make_candidate("third", rrf_score=0.1),
+    ]
+
+    result = retriever._rerank("unmatched-query", candidates, "model")
+
+    assert result.method == "keyword"
+    assert [item.chunk_id for item in result.items] == ["first", "second", "third"]
 
 
 def test_mmr_embeds_candidate_documents_in_one_batch():
