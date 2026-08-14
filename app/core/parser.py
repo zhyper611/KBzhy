@@ -26,6 +26,10 @@ class ParsedArtifactError(ValueError):
     """Raised when a parsed artifact does not match the persisted schema."""
 
 
+class DocumentParseError(ValueError):
+    """Raised when a source cannot produce indexable document elements."""
+
+
 class Document:
     """解析后的文档"""
 
@@ -123,15 +127,40 @@ class DocumentParser:
         self._validate_version(version)
 
         source = Path(file_path)
-        documents = self.parse(source)
-        metadata = dict(documents[0].metadata) if documents else {}
+        ext = source.suffix.lower()
+        category = self._ext_map.get(ext)
+        if category is None:
+            raise ValueError(f"不支持的文件格式: {ext}")
+
+        from KBzhy.app.core.parsers.pdf_parser import parse_pdf
+        from KBzhy.app.core.parsers.text_parser import parse_markdown, parse_text
+        from KBzhy.app.core.parsers.word_parser import parse_word
+
+        structured_parsers = {
+            ".pdf": parse_pdf,
+            ".docx": parse_word,
+            ".md": parse_markdown,
+            ".txt": parse_text,
+        }
+        structured_parser = structured_parsers.get(ext)
+        if structured_parser is None or not source.exists():
+            documents = self.parse(source)
+            elements = self._legacy_to_elements(documents, document_id)
+            metadata = dict(documents[0].metadata) if documents else {}
+        else:
+            elements = structured_parser(source, document_id=document_id)
+            metadata = {
+                "source": source.name,
+                "file_type": category,
+                "file_path": str(source),
+            }
         metadata["kb_id"] = kb_id
         return ParsedDocument(
             document_id=document_id,
             version=version,
             title=source.stem,
             language="und",
-            elements=self._legacy_to_elements(documents, document_id),
+            elements=elements,
             metadata=metadata,
         )
 
