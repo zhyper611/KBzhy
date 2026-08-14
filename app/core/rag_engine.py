@@ -288,6 +288,20 @@ class RAGEngine:
     def remove_children(self, kb_id: str, chunk_ids: list[str]) -> None:
         self.retriever.remove_children(kb_id, chunk_ids)
 
+    def stage_collection_children(
+        self,
+        collection_name: str,
+        kb_id: str,
+        document_id: str,
+        children: list[KnowledgeChunk],
+    ) -> None:
+        self.retriever.stage_collection_children(
+            collection_name, kb_id, document_id, children
+        )
+
+    def delete_collection(self, collection_name: str) -> None:
+        self.retriever.delete_collection(collection_name)
+
     def remove_parsed_artifact(self, artifact_path: str) -> None:
         target = Path(artifact_path).resolve()
         root = Path(self.parser._artifact_dir).resolve()

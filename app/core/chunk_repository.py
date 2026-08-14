@@ -250,6 +250,70 @@ class ChunkRepository:
             finally:
                 cursor.close()
 
+    def replace_reindex_staging(
+        self,
+        task_id: str,
+        document_id: str,
+        version: int,
+        chunks: Sequence[KnowledgeChunk],
+    ) -> None:
+        now = datetime.now()
+        values = []
+        for chunk in chunks:
+            if chunk.document_id != document_id or chunk.document_version != version:
+                raise ValueError("chunk document identity does not match reindex target")
+            values.append(self._serialize(task_id, chunk, "staging", now))
+        if not values:
+            raise ValueError("reindex staging requires chunks")
+        with self._connection() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT current_version, status FROM documents WHERE doc_id=%s FOR UPDATE",
+                    (document_id,),
+                )
+                document = cursor.fetchone()
+                if (
+                    not document
+                    or int(document.get("current_version") or 0) != version
+                    or document.get("status") == "deleting"
+                ):
+                    raise ValueError("document version changed during reindex")
+                cursor.execute(
+                    "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                    (task_id,),
+                )
+                task = cursor.fetchone()
+                if (
+                    not task
+                    or task.get("doc_id") != document_id
+                    or int(task.get("document_version") or 0) != version
+                    or task.get("status") != "reindexing"
+                ):
+                    raise ValueError("reindex task identity or status does not match target")
+                cursor.execute(
+                    "SELECT version FROM document_versions "
+                    "WHERE doc_id=%s AND version=%s AND status='active' FOR UPDATE",
+                    (document_id, version),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("active document version does not exist")
+                cursor.execute(
+                    "DELETE FROM document_chunks WHERE task_id=%s AND status='staging'",
+                    (task_id,),
+                )
+                placeholders = ", ".join(["%s"] * len(self._columns))
+                cursor.executemany(
+                    f"INSERT INTO document_chunks ({', '.join(self._columns)}) VALUES ({placeholders})",
+                    values,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                cursor.close()
+
     @staticmethod
     def _validate_staging_batch(rows: Sequence[dict]) -> int:
         children = [row for row in rows if row["chunk_type"] == "child"]

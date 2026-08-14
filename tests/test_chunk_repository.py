@@ -204,12 +204,7 @@ class MemoryCursor:
             doc_id = params[0]
             if doc_id not in self.connection.documents:
                 return []
-            document = self.connection.documents[doc_id]
-            return [{
-                "doc_id": doc_id,
-                "task_id": document.get("task_id"),
-                "status": document.get("status"),
-            }]
+            return [{"doc_id": doc_id, **deepcopy(self.connection.documents[doc_id])}]
         if "FROM document_index_tasks" in sql and "FOR UPDATE" in sql:
             task = self.connection.tasks.get(params[0])
             return [deepcopy(task)] if task else []
@@ -351,6 +346,24 @@ def test_replace_staging_roundtrips_chunks_and_is_idempotent():
     assert repo.list_by_task("task-1") == chunks
     assert len(connection.rows) == 3
     assert connection.commits == 2
+
+
+def test_replace_reindex_staging_does_not_require_document_task_ownership():
+    connection = MemoryConnection()
+    connection.documents["doc-1"]["task_id"] = "active-owner"
+    connection.tasks["migration-task"] = {
+        "task_id": "migration-task", "doc_id": "doc-1", "document_version": 1,
+        "index_version": 1, "status": "reindexing",
+    }
+    chunks = [make_parent(), make_child("child", 0)]
+
+    ChunkRepository(connection).replace_reindex_staging(
+        "migration-task", "doc-1", 1, chunks
+    )
+
+    assert {row["status"] for row in connection.rows} == {"staging"}
+    assert {row["task_id"] for row in connection.rows} == {"migration-task"}
+    assert connection.documents["doc-1"]["task_id"] == "active-owner"
 
 
 def test_list_by_task_has_stable_parent_first_order_for_equal_positions():

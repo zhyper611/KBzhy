@@ -93,22 +93,37 @@ class Retriever:
         )
         # kb_id → Chroma 实例
         self._vectorstores: dict[str, Chroma] = {}
+        self._vectorstore_names: dict[str, str] = {}
         # kb_id → (BM25Okapi, list[{content, metadata}])
         self._bm25_indices: dict[str, tuple[BM25Okapi | None, list[dict[str, Any]]]] = {}
         self._active_version_resolver = self._load_active_versions
+        self._active_collection_resolver = self._load_active_collection
 
     # ── 知识库管理 ────────────────────────────────
 
     def _collection_name(self, kb_id: str) -> str:
-        return f"{_KB_COLLECTION_PREFIX}{kb_id}"
+        fallback = f"{_KB_COLLECTION_PREFIX}{kb_id}"
+        try:
+            return self._active_collection_resolver(kb_id) or fallback
+        except Exception as exc:
+            logger.error("failed to resolve active collection: kb=%s error=%s", kb_id, exc)
+            if kb_id in self._vectorstore_names:
+                return self._vectorstore_names[kb_id]
+            raise
+
+    def _get_named_vectorstore(self, collection_name: str) -> Chroma:
+        return Chroma(
+            persist_directory=self.persist_dir,
+            embedding_function=self.embeddings,
+            collection_name=collection_name,
+        )
 
     def _get_vectorstore(self, kb_id: str) -> Chroma:
-        if kb_id not in self._vectorstores:
-            self._vectorstores[kb_id] = Chroma(
-                persist_directory=self.persist_dir,
-                embedding_function=self.embeddings,
-                collection_name=self._collection_name(kb_id),
-            )
+        collection_name = self._collection_name(kb_id)
+        if self._vectorstore_names.get(kb_id) != collection_name:
+            self._vectorstores[kb_id] = self._get_named_vectorstore(collection_name)
+            self._vectorstore_names[kb_id] = collection_name
+            self._bm25_indices.pop(kb_id, None)
         return self._vectorstores[kb_id]
 
     def create_kb(self, kb_id: str):
@@ -126,6 +141,7 @@ class Retriever:
             except Exception as exc:
                 logger.warning("删除 ChromaDB collection 失败: %s", exc)
             del self._vectorstores[kb_id]
+            self._vectorstore_names.pop(kb_id, None)
         # 确保 ChromaDB 持久化 collection 也被删除（处理重启后缓存丢失的情况）
         try:
             import chromadb
@@ -266,6 +282,50 @@ class Retriever:
             ]
             self._bm25_indices[kb_id] = (None, retained + entries)
             self._rebuild_bm25(kb_id)
+
+    def stage_collection_children(
+        self,
+        collection_name: str,
+        kb_id: str,
+        document_id: str,
+        new_children: list[KnowledgeChunk],
+    ) -> None:
+        if any(
+            chunk.chunk_type != "child" or chunk.document_id != document_id
+            for chunk in new_children
+        ):
+            raise ValueError("only children belonging to the target document may be staged")
+        if not new_children:
+            return
+        from langchain_core.documents import Document as LCDocument
+
+        ids = [chunk.chunk_id for chunk in new_children]
+        documents = []
+        for chunk in new_children:
+            metadata = self._normalize_chroma_metadata(chunk.metadata)
+            metadata.update({
+                "kb_id": kb_id,
+                "chunk_id": chunk.chunk_id,
+                "doc_id": chunk.document_id,
+                "document_version": chunk.document_version,
+                "parent_chunk_id": chunk.parent_chunk_id or "",
+                "section_path": json.dumps(list(chunk.section_path), ensure_ascii=False),
+                "position": chunk.position,
+                "index_version": chunk.index_version,
+            })
+            if chunk.page_start is not None:
+                metadata["page_start"] = chunk.page_start
+                metadata.setdefault("page", chunk.page_start)
+            if chunk.page_end is not None:
+                metadata["page_end"] = chunk.page_end
+            documents.append(LCDocument(page_content=chunk.retrieval_text, metadata=metadata))
+        self._get_named_vectorstore(collection_name).add_documents(documents, ids=ids)
+
+    def delete_collection(self, collection_name: str) -> None:
+        import chromadb
+
+        client = chromadb.PersistentClient(path=self.persist_dir)
+        client.delete_collection(collection_name)
 
     def remove_children(self, kb_id: str, chunk_ids: list[str]) -> None:
         ids = list(dict.fromkeys(chunk_ids))
@@ -564,6 +624,12 @@ class Retriever:
         from KBzhy.app.core.metadata_store import get_metadata_store
 
         return ChunkRepository(get_metadata_store()).get_active_versions(document_ids)
+
+    @staticmethod
+    def _load_active_collection(kb_id: str) -> str | None:
+        from KBzhy.app.core.metadata_store import get_metadata_store
+
+        return get_metadata_store().get_active_collection_name(kb_id)
 
     def _vector_search(self, query: str, kb_id: str, k: int) -> list[tuple[str, dict, float]]:
         """向量相似度检索"""

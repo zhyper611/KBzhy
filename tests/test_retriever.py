@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from KBzhy.app.core.document_models import KnowledgeChunk
 from KBzhy.app.core.retriever import Retriever
 from KBzhy.app.core.splitter import Chunk
@@ -102,6 +104,70 @@ def test_remove_children_deletes_only_explicit_ids_from_both_indices():
     assert fake_vs.deleted_ids == ["child-1"]
     _, entries = retriever._bm25_indices["kb1"]
     assert [entry["metadata"]["chunk_id"] for entry in entries] == ["child-2"]
+
+
+def test_active_collection_switch_replaces_vectorstore_and_invalidates_bm25():
+    retriever = Retriever.__new__(Retriever)
+    active = {"name": "kbzhy_kb1"}
+    stores = {}
+    retriever._active_collection_resolver = lambda kb_id: active["name"]
+    retriever._vectorstores = {}
+    retriever._vectorstore_names = {}
+    retriever._bm25_indices = {"kb1": (object(), [{"content": "old"}])}
+    retriever._get_named_vectorstore = lambda name: stores.setdefault(name, object())
+
+    old_store = retriever._get_vectorstore("kb1")
+    active["name"] = "kbzhy_kb1_v2_20260814"
+    new_store = retriever._get_vectorstore("kb1")
+
+    assert old_store is stores["kbzhy_kb1"]
+    assert new_store is stores["kbzhy_kb1_v2_20260814"]
+    assert new_store is not old_store
+    assert "kb1" not in retriever._bm25_indices
+
+
+def test_active_collection_lookup_failure_keeps_last_known_collection():
+    retriever = Retriever.__new__(Retriever)
+    retriever._vectorstore_names = {"kb1": "kbzhy_kb1_v2_stable"}
+
+    def fail(_kb_id):
+        raise RuntimeError("database unavailable")
+
+    retriever._active_collection_resolver = fail
+
+    assert retriever._collection_name("kb1") == "kbzhy_kb1_v2_stable"
+
+
+def test_active_collection_lookup_failure_without_cache_fails_closed():
+    retriever = Retriever.__new__(Retriever)
+    retriever._vectorstore_names = {}
+    retriever._active_collection_resolver = lambda _kb_id: (_ for _ in ()).throw(
+        RuntimeError("database unavailable")
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        retriever._collection_name("kb1")
+
+
+def test_stage_collection_children_targets_explicit_collection_without_bm25_mutation():
+    retriever = Retriever.__new__(Retriever)
+    fake_vs = FakeVectorStore()
+    retriever._bm25_indices = {"kb1": (None, [{"content": "active"}])}
+    requested = []
+
+    def get_named(name):
+        requested.append(name)
+        return fake_vs
+
+    retriever._get_named_vectorstore = get_named
+
+    retriever.stage_collection_children(
+        "kbzhy_kb1_v2_temp", "kb1", "doc-1", [make_knowledge_chunk("child-1")]
+    )
+
+    assert requested == ["kbzhy_kb1_v2_temp"]
+    assert fake_vs.added_ids == ["child-1"]
+    assert retriever._bm25_indices["kb1"][1] == [{"content": "active"}]
 
 
 def test_versioned_candidates_must_match_mysql_active_version():

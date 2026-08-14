@@ -697,6 +697,7 @@ class MySQLMetadataStore:
             "kb_id": row["kb_id"],
             "name": row["name"],
             "description": row.get("description") or "",
+            "active_collection_name": row.get("active_collection_name"),
             "created_at": cls._dt(row["created_at"]),
         }
 
@@ -760,6 +761,22 @@ class MySQLMetadataStore:
         row = cur.fetchone()
         cur.close()
         return self._kb_from_row(row)
+
+    def get_active_collection_name(self, kb_id: str) -> str | None:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT active_collection_name FROM knowledge_bases WHERE kb_id=%s",
+                (kb_id,),
+            )
+            row = cur.fetchone()
+            return row.get("active_collection_name") if row else None
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
 
     def list_knowledge_bases(self) -> list[dict]:
         cur = self._execute(
@@ -1090,6 +1107,239 @@ class MySQLMetadataStore:
         )
         cur.close()
         self._conn.commit()
+
+    def create_reindex_task(
+        self,
+        kb_id: str,
+        document_id: str,
+        task_id: str,
+        index_version: int,
+        now: str,
+    ) -> dict:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            self._lock_knowledge_base(cur, kb_id)
+            cur.execute(
+                "SELECT * FROM documents WHERE kb_id=%s AND doc_id=%s FOR UPDATE",
+                (kb_id, document_id),
+            )
+            document = cur.fetchone()
+            if not document or document.get("status") != "ready":
+                raise DocumentNotFoundError(document_id)
+            version = int(document.get("current_version") or 0)
+            cur.execute(
+                "SELECT version FROM document_versions "
+                "WHERE doc_id=%s AND version=%s AND status='active' FOR UPDATE",
+                (document_id, version),
+            )
+            if cur.fetchone() is None:
+                raise RuntimeError("ready document has no active version")
+            timestamp = self._mysql_dt(now)
+            cur.execute(
+                """
+                INSERT INTO document_index_tasks
+                    (task_id, doc_id, kb_id, status, error_message, created_at, updated_at,
+                     document_version, index_version, attempt_count)
+                VALUES (%s, %s, %s, 'reindexing', NULL, %s, %s, %s, %s, 0)
+                """,
+                (task_id, document_id, kb_id, timestamp, timestamp, version, index_version),
+            )
+            conn.commit()
+            result = self._doc_from_row(document)
+            result["document_version"] = version
+            result["owner_task_id"] = document.get("task_id")
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def activate_reindex(
+        self,
+        kb_id: str,
+        collection_name: str,
+        manifests: list[dict],
+    ) -> None:
+        if not manifests:
+            raise ValueError("reindex activation requires documents")
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            self._lock_knowledge_base(cur, kb_id)
+            cur.execute(
+                "SELECT doc_id, status FROM documents WHERE kb_id=%s ORDER BY doc_id FOR UPDATE",
+                (kb_id,),
+            )
+            current_documents = cur.fetchall()
+            expected_document_ids = {item["document_id"] for item in manifests}
+            ready_document_ids = {
+                row["doc_id"] for row in current_documents if row.get("status") == "ready"
+            }
+            if (
+                ready_document_ids != expected_document_ids
+                or any(
+                    row.get("status") in {
+                        "queued", "parsing", "chunking", "indexing", "deleting"
+                    }
+                    for row in current_documents
+                )
+            ):
+                raise RuntimeError("knowledge base documents changed during reindex")
+            for manifest in sorted(manifests, key=lambda item: item["document_id"]):
+                doc_id = manifest["document_id"]
+                version = int(manifest["document_version"])
+                task_id = manifest["task_id"]
+                cur.execute(
+                    "SELECT current_version, status, task_id FROM documents "
+                    "WHERE kb_id=%s AND doc_id=%s FOR UPDATE",
+                    (kb_id, doc_id),
+                )
+                document = cur.fetchone()
+                if (
+                    not document
+                    or document.get("status") != "ready"
+                    or int(document.get("current_version") or 0) != version
+                    or document.get("task_id") != manifest.get("owner_task_id")
+                ):
+                    raise RuntimeError("document changed during reindex")
+                cur.execute(
+                    "SELECT doc_id, document_version, index_version, status "
+                    "FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                    (task_id,),
+                )
+                task = cur.fetchone()
+                if (
+                    not task
+                    or task.get("doc_id") != doc_id
+                    or int(task.get("document_version") or 0) != version
+                    or int(task.get("index_version") or 0) != int(manifest["index_version"])
+                    or task.get("status") != "reindexing"
+                ):
+                    raise RuntimeError("reindex task changed before activation")
+                cur.execute(
+                    "SELECT chunk_type, index_version FROM document_chunks "
+                    "WHERE task_id=%s AND doc_id=%s AND document_version=%s "
+                    "AND status='staging' FOR UPDATE",
+                    (task_id, doc_id, version),
+                )
+                chunks = cur.fetchall()
+                child_count = sum(row["chunk_type"] == "child" for row in chunks)
+                if (
+                    not chunks
+                    or child_count != int(manifest["child_count"])
+                    or any(int(row["index_version"]) != int(manifest["index_version"]) for row in chunks)
+                ):
+                    raise RuntimeError("reindex chunk batch changed before activation")
+                cur.execute(
+                    "UPDATE document_chunks SET status='inactive', updated_at=NOW(3) "
+                    "WHERE doc_id=%s AND status='active'",
+                    (doc_id,),
+                )
+                cur.execute(
+                    "UPDATE document_chunks SET status='active', updated_at=NOW(3) "
+                    "WHERE task_id=%s AND status='staging'",
+                    (task_id,),
+                )
+                if cur.rowcount != len(chunks):
+                    raise RuntimeError("reindex chunk activation count changed")
+                cur.execute(
+                    "UPDATE documents SET active_index_version=%s, parsed_artifact_path=%s, "
+                    "chunk_count=%s, updated_at=NOW(3) WHERE doc_id=%s",
+                    (
+                        manifest["index_version"], manifest.get("artifact_path"),
+                        child_count, doc_id,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE document_versions SET parsed_artifact_path=%s "
+                    "WHERE doc_id=%s AND version=%s AND status='active'",
+                    (manifest.get("artifact_path"), doc_id, version),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("active document version changed during reindex")
+                cur.execute(
+                    "UPDATE document_index_tasks SET status='ready', updated_at=NOW(3) "
+                    "WHERE task_id=%s AND status='reindexing'",
+                    (task_id,),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("reindex task activation count changed")
+            cur.execute(
+                "UPDATE knowledge_bases SET active_collection_name=%s WHERE kb_id=%s",
+                (collection_name, kb_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("knowledge base collection switch failed")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def abort_reindex(self, task_ids: list[str]) -> None:
+        if not task_ids:
+            return
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            placeholders = ", ".join(["%s"] * len(task_ids))
+            cur.execute(
+                f"DELETE FROM document_chunks WHERE status='staging' AND task_id IN ({placeholders})",
+                tuple(task_ids),
+            )
+            cur.execute(
+                f"DELETE FROM document_index_tasks WHERE status='reindexing' AND task_id IN ({placeholders})",
+                tuple(task_ids),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def is_reindex_committed(
+        self,
+        kb_id: str,
+        collection_name: str,
+        task_ids: list[str],
+    ) -> bool:
+        if not task_ids:
+            return False
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            placeholders = ", ".join(["%s"] * len(task_ids))
+            cur.execute(
+                "SELECT active_collection_name FROM knowledge_bases WHERE kb_id=%s",
+                (kb_id,),
+            )
+            kb = cur.fetchone()
+            if not kb or kb.get("active_collection_name") != collection_name:
+                return False
+            cur.execute(
+                f"SELECT COUNT(*) AS total FROM document_index_tasks "
+                f"WHERE status='ready' AND task_id IN ({placeholders})",
+                tuple(task_ids),
+            )
+            return int((cur.fetchone() or {}).get("total") or 0) == len(set(task_ids))
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
 
     def complete_indexing_task(self, task_id: str, chunk_count: int) -> None:
         conn = self.create_connection()
