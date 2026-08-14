@@ -149,8 +149,14 @@ class MemoryCursor:
             if row and row["status"] == "staging":
                 row["status"] = "active"
                 self.rowcount = 1
+        elif normalized.startswith("UPDATE document_versions SET parsed_artifact_path=%s"):
+            path, doc_id, version = params
+            row = self.connection.document_versions.get((doc_id, version))
+            if row and row["status"] == "staging":
+                row["parsed_artifact_path"] = path
+                self.rowcount = 1
         elif normalized.startswith("UPDATE documents"):
-            version, index_version, doc_id, task_id = params[-4:]
+            version, index_version, chunk_count, doc_id, task_id = params[-5:]
             if doc_id in self.connection.documents:
                 version_row = self.connection.document_versions[(doc_id, version)]
                 self.connection.documents[doc_id].update(
@@ -162,6 +168,7 @@ class MemoryCursor:
                     storage_path=version_row["storage_path"],
                     parser_version=version_row["parser_version"],
                     parsed_artifact_path=version_row["parsed_artifact_path"],
+                    chunk_count=chunk_count,
                     status="ready",
                 )
                 self.rowcount = 1
@@ -228,10 +235,6 @@ class MemoryCursor:
         elif "chunk_id=%s AND status='active' AND chunk_type='parent'" in sql:
             task_id, doc_id, version, chunk_id = params
             rows = [r for r in rows if r["task_id"] == task_id and r["doc_id"] == doc_id and r["document_version"] == version and r["chunk_id"] == chunk_id and r["status"] == "active" and r["chunk_type"] == "parent"]
-        elif "status='active' AND chunk_type='child'" in sql:
-            rows = [r for r in rows if r["status"] == "active" and r["chunk_type"] == "child"]
-            if params:
-                rows = [r for r in rows if r["doc_id"] == params[0]]
         elif "SELECT doc_id, document_version" in sql:
             ids = set(params)
             rows = [r for r in rows if r["doc_id"] in ids and r["status"] == "active" and r["chunk_type"] == "child"]
@@ -239,6 +242,10 @@ class MemoryCursor:
             for row in rows:
                 unique[row["doc_id"]] = {"doc_id": row["doc_id"], "document_version": row["document_version"]}
             return list(unique.values())
+        elif "status='active' AND chunk_type='child'" in sql:
+            rows = [r for r in rows if r["status"] == "active" and r["chunk_type"] == "child"]
+            if params:
+                rows = [r for r in rows if r["doc_id"] == params[0]]
         if "CASE WHEN chunk_type='parent' THEN 0 ELSE 1 END" in sql:
             return sorted(
                 (deepcopy(r) for r in rows),
@@ -293,6 +300,18 @@ def test_replace_staging_locks_parent_rows_before_chunks():
     version_lock = next(i for i, sql in enumerate(statements) if "FROM document_versions" in sql and sql.endswith("FOR UPDATE"))
     chunk_delete = next(i for i, sql in enumerate(statements) if sql.startswith("DELETE FROM document_chunks"))
     assert document_lock < task_lock < version_lock < chunk_delete
+
+
+def test_replace_staging_persists_artifact_path_for_activation():
+    connection = MemoryConnection()
+    chunks = [make_parent(version=2), make_child("child", 0, version=2)]
+    prepare_staging(connection, "task-2", "doc-1", 2, chunks)
+
+    ChunkRepository(connection).replace_staging(
+        "task-2", "doc-1", 2, chunks, parsed_artifact_path="/parsed/new-v2.json"
+    )
+
+    assert connection.document_versions[("doc-1", 2)]["parsed_artifact_path"] == "/parsed/new-v2.json"
 
 
 @pytest.mark.parametrize(
@@ -379,10 +398,10 @@ def test_activate_version_switches_status_and_updates_document_versions():
     assert connection.documents["doc-1"] == {
         "current_version": 2, "active_index_version": 5, "content_hash": "new-hash",
         "filename": "new.pdf", "file_type": ".pdf",
-        "storage_path": "/uploads/kb/doc-1/task-2/new.pdf",
-        "parser_version": "parser-v2", "parsed_artifact_path": "/parsed/v2.json",
-        "status": "ready", "task_id": "new-task",
-    }
+            "storage_path": "/uploads/kb/doc-1/task-2/new.pdf",
+            "parser_version": "parser-v2", "parsed_artifact_path": "/parsed/v2.json",
+            "status": "ready", "task_id": "new-task", "chunk_count": 1,
+        }
     assert connection.document_versions[("doc-1", 1)]["status"] == "inactive"
     assert connection.document_versions[("doc-1", 2)]["status"] == "active"
 
@@ -507,7 +526,7 @@ def test_get_active_versions_returns_versions_for_requested_documents():
     for row in connection.rows:
         row["status"] = "active"
 
-    assert repo.get_active_versions(["doc-1", "missing", "doc-1"]) == {"doc-1": 1}
+    assert repo.get_active_versions(["doc-1", "missing", "doc-1"]) == {"doc-1": 2}
 
 
 def test_same_chunk_id_can_stage_in_different_tasks():

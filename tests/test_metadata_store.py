@@ -1594,6 +1594,9 @@ class LifecycleLockOrderConnection:
                 elif normalized.startswith("UPDATE document_index_tasks SET status='indexing'"):
                     connection.task["status"] = "indexing"
                     self.rowcount = 1
+                elif normalized.startswith("UPDATE document_index_tasks SET status='chunking'"):
+                    connection.task["status"] = "chunking"
+                    self.rowcount = 1
                 elif normalized.startswith("UPDATE documents"):
                     self.rowcount = 1
 
@@ -1619,6 +1622,7 @@ class LifecycleLockOrderConnection:
     ("method_name", "task_status", "args"),
     [
         ("requeue_indexing_task", "indexing", ("task1",)),
+        ("set_indexing_phase", "parsing", ("task1", "chunking")),
         ("set_indexing_phase", "parsing", ("task1", "indexing")),
     ],
 )

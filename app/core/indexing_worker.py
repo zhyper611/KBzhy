@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from KBzhy.app.core.engine import get_rag_engine
+from KBzhy.app.core.chunk_repository import ChunkRepository
 from KBzhy.app.core.metadata_store import get_metadata_store, now_iso
 from KBzhy.config import UPLOAD_STORAGE_DIR
 
@@ -15,9 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 class IndexingWorker:
-    def __init__(self, store=None, engine_factory: Callable | None = None, autostart: bool = True):
+    def __init__(
+        self,
+        store=None,
+        engine_factory: Callable | None = None,
+        autostart: bool = True,
+        chunk_repository=None,
+    ):
         self.store = store or get_metadata_store()
         self.engine_factory = engine_factory or get_rag_engine
+        self.chunk_repository = chunk_repository
+        if self.chunk_repository is None and hasattr(self.store, "create_connection"):
+            self.chunk_repository = ChunkRepository(self.store)
         self._queue: queue.Queue[str] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -73,7 +83,23 @@ class IndexingWorker:
                 self.store.update_document(doc["id"], status="queued", error_message=None)
                 self.store.update_task(task_id, status="queued", error_message=None)
             try:
-                self.engine_factory().remove_document(version["filename"], doc["kb_id"], doc_id=doc["id"], task_id=task_id)
+                engine = self.engine_factory()
+                if self.chunk_repository is not None and hasattr(engine, "remove_children"):
+                    staged_child_ids = [
+                        chunk.chunk_id
+                        for chunk in self.chunk_repository.list_by_task(task_id)
+                        if chunk.chunk_type == "child"
+                    ]
+                    engine.remove_children(doc["kb_id"], staged_child_ids)
+                    self.chunk_repository.discard_task(task_id)
+                    self._remove_prepared_artifact(
+                        engine, version.get("parsed_artifact_path")
+                    )
+                else:
+                    engine.remove_document(
+                        version["filename"], doc["kb_id"],
+                        doc_id=doc["id"], task_id=task_id,
+                    )
             except Exception as exc:
                 logger.warning("恢复任务时清理旧向量失败: task=%s error=%s", task_id, exc)
             self.enqueue(task_id)
@@ -126,7 +152,123 @@ class IndexingWorker:
             self.store.update_document(doc["id"], status="parsing", error_message=None)
 
         engine = self.engine_factory()
+        structured_mode = bool(
+            self.chunk_repository is not None
+            and hasattr(engine, "parse_document_for_index")
+            and hasattr(engine, "chunk_document_for_index")
+            and hasattr(engine, "stage_document_children")
+            and hasattr(engine, "remove_children")
+        )
+        staged_child_ids: list[str] = []
+        prepared_artifact_path: str | None = None
         try:
+            if structured_mode:
+                parsed_artifact = engine.parse_document_for_index(
+                    version["storage_path"],
+                    doc["kb_id"],
+                    document_id=doc["id"],
+                    document_version=int(task["document_version"]),
+                    display_name=version["filename"],
+                )
+                prepared_artifact_path = parsed_artifact.artifact_path
+                if hasattr(self.store, "set_indexing_phase"):
+                    if not self.store.set_indexing_phase(task_id, "chunking"):
+                        changed = self._mark_terminal(
+                            task, doc, "stale", "document changed before chunking"
+                        )
+                        if changed:
+                            self._remove_prepared_artifact(engine, prepared_artifact_path)
+                            self._discard_version(
+                                task, version, "stale", doc, status_already_updated=True
+                            )
+                        return
+                else:
+                    self.store.update_task(task_id, status="chunking")
+                    self.store.update_document(doc["id"], status="chunking")
+
+                prepared = engine.chunk_document_for_index(
+                    parsed_artifact,
+                    index_version=int(task.get("index_version") or 1),
+                )
+                chunks = list(prepared.chunks)
+                children = [chunk for chunk in chunks if chunk.chunk_type == "child"]
+                if not children:
+                    raise RuntimeError("structured indexing produced no child chunks")
+                old_child_ids = [
+                    chunk.chunk_id
+                    for chunk in self.chunk_repository.list_active_children(doc["id"])
+                ]
+                self.chunk_repository.replace_staging(
+                    task_id,
+                    doc["id"],
+                    int(task["document_version"]),
+                    chunks,
+                    parsed_artifact_path=prepared.artifact_path,
+                )
+                if hasattr(self.store, "set_indexing_phase"):
+                    if not self.store.set_indexing_phase(task_id, "indexing"):
+                        changed = self._mark_terminal(
+                            task, doc, "stale", "document changed before indexing"
+                        )
+                        if changed:
+                            self.chunk_repository.discard_task(task_id)
+                            self._remove_prepared_artifact(engine, prepared_artifact_path)
+                            self._discard_version(
+                                task, version, "stale", doc, status_already_updated=True
+                            )
+                        return
+                else:
+                    self.store.update_task(task_id, status="indexing")
+                    self.store.update_document(doc["id"], status="indexing")
+
+                staged_child_ids = [chunk.chunk_id for chunk in children]
+                engine.stage_document_children(doc["kb_id"], doc["id"], children)
+                latest_doc = self.store.get_document(task["kb_id"], task["doc_id"])
+                if (
+                    not latest_doc
+                    or latest_doc.get("task_id") != task_id
+                    or latest_doc.get("status") == "deleting"
+                ):
+                    self._rollback_structured_index(
+                        engine,
+                        doc["kb_id"],
+                        staged_child_ids,
+                        task_id,
+                        prepared_artifact_path,
+                        self.chunk_repository,
+                    )
+                    changed = self._mark_terminal(
+                        task, latest_doc or doc, "stale", "document changed before commit"
+                    )
+                    if changed:
+                        self._discard_version(
+                            task,
+                            version,
+                            "stale",
+                            latest_doc or doc,
+                            status_already_updated=True,
+                        )
+                    return
+
+                self.chunk_repository.activate_version(
+                    doc["id"], int(task["document_version"]), task_id
+                )
+                try:
+                    engine.remove_children(doc["kb_id"], old_child_ids)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "active version committed but old child cleanup failed: task=%s error=%s",
+                        task_id,
+                        cleanup_exc,
+                    )
+                logger.info(
+                    "structured indexing task completed: task=%s doc=%s children=%d",
+                    task_id,
+                    doc["id"],
+                    len(children),
+                )
+                return
+
             if hasattr(self.store, "set_indexing_phase"):
                 if not self.store.set_indexing_phase(task_id, "indexing"):
                     changed = self._mark_terminal(task, doc, "stale", "document changed before indexing")
@@ -173,7 +315,22 @@ class IndexingWorker:
                 return
             error = str(exc)
             try:
-                engine.remove_document(version["filename"], doc["kb_id"], doc_id=doc["id"], task_id=task_id)
+                if structured_mode:
+                    cleanup_error = self._rollback_structured_index(
+                        engine,
+                        doc["kb_id"],
+                        staged_child_ids,
+                        task_id,
+                        prepared_artifact_path,
+                        self.chunk_repository,
+                    )
+                    if cleanup_error:
+                        error = f"{error}; rollback failed: {cleanup_error}"
+                else:
+                    engine.remove_document(
+                        version["filename"], doc["kb_id"],
+                        doc_id=doc["id"], task_id=task_id,
+                    )
             except Exception as cleanup_exc:
                 logger.warning("索引失败后回滚向量失败: task=%s error=%s", task_id, cleanup_exc)
                 error = f"{error}; rollback failed: {cleanup_exc}"
@@ -181,6 +338,36 @@ class IndexingWorker:
             if changed:
                 self._discard_version(task, version, "failed", doc, status_already_updated=True)
             logger.exception("索引任务失败: task=%s doc=%s", task_id, doc["id"])
+
+    @staticmethod
+    def _rollback_structured_index(
+        engine,
+        kb_id: str,
+        child_ids: list[str],
+        task_id: str,
+        artifact_path: str | None,
+        repository=None,
+    ) -> str | None:
+        errors = []
+        try:
+            engine.remove_children(kb_id, child_ids)
+        except Exception as exc:
+            errors.append(str(exc))
+        if repository is not None:
+            try:
+                repository.discard_task(task_id)
+            except Exception as exc:
+                errors.append(str(exc))
+        IndexingWorker._remove_prepared_artifact(engine, artifact_path)
+        return "; ".join(errors) or None
+
+    @staticmethod
+    def _remove_prepared_artifact(engine, artifact_path: str | None) -> None:
+        if artifact_path and hasattr(engine, "remove_parsed_artifact"):
+            try:
+                engine.remove_parsed_artifact(artifact_path)
+            except Exception as exc:
+                logger.warning("failed to remove parsed artifact %s: %s", artifact_path, exc)
 
     def _completion_state(self, task: dict) -> bool | None:
         try:

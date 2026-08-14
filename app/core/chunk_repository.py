@@ -66,6 +66,7 @@ class ChunkRepository:
         document_id: str,
         version: int,
         chunks: Sequence[KnowledgeChunk],
+        parsed_artifact_path: str | None = None,
     ) -> None:
         now = datetime.now()
         values = []
@@ -106,6 +107,14 @@ class ChunkRepository:
                 )
                 if cursor.fetchone() is None:
                     raise ValueError("staging document version does not exist")
+                if parsed_artifact_path is not None:
+                    cursor.execute(
+                        "UPDATE document_versions SET parsed_artifact_path=%s "
+                        "WHERE doc_id=%s AND version=%s AND status='staging'",
+                        (parsed_artifact_path, document_id, version),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("staging document version changed during artifact update")
                 cursor.execute(
                     "DELETE FROM document_chunks WHERE task_id=%s AND status='staging'",
                     (task_id,),
@@ -169,6 +178,7 @@ class ChunkRepository:
                 )
                 rows = cursor.fetchall()
                 index_version = self._validate_staging_batch(rows)
+                child_count = sum(row["chunk_type"] == "child" for row in rows)
                 if int(task.get("index_version") or 0) != index_version:
                     raise ValueError("indexing task index_version does not match staging batch")
                 expected_count = len(rows)
@@ -210,14 +220,15 @@ class ChunkRepository:
                     SET content_hash=%s, filename=%s, file_type=%s, storage_path=%s,
                         parser_version=%s, parsed_artifact_path=%s,
                         current_version=%s, active_index_version=%s,
-                        status='ready', error_message=NULL, updated_at=NOW(3)
+                        status='ready', chunk_count=%s,
+                        error_message=NULL, updated_at=NOW(3)
                     WHERE doc_id=%s AND task_id=%s AND status<>'deleting'
                     """,
                     (
                         version_row.get("content_hash"), version_row.get("filename"),
                         version_row.get("file_type"), version_row.get("storage_path"),
                         version_row.get("parser_version"), version_row.get("parsed_artifact_path"),
-                        version, index_version, document_id, task_id,
+                        version, index_version, child_count, document_id, task_id,
                     ),
                 )
                 if cursor.rowcount != 1:
@@ -345,13 +356,19 @@ class ChunkRepository:
             cursor = connection.cursor()
             try:
                 cursor.execute(
-                    f"SELECT doc_id, current_version FROM documents WHERE doc_id IN ({placeholders})",
+                    f"""
+                    SELECT doc_id, document_version
+                    FROM document_chunks
+                    WHERE status='active' AND chunk_type='child'
+                      AND doc_id IN ({placeholders})
+                    GROUP BY doc_id, document_version
+                    """,
                     ids,
                 )
                 rows = cursor.fetchall()
             finally:
                 cursor.close()
-        return {row["doc_id"]: int(row["current_version"]) for row in rows}
+        return {row["doc_id"]: int(row["document_version"]) for row in rows}
 
     @classmethod
     def _serialize(cls, task_id: str, chunk: KnowledgeChunk, status: str, now: datetime) -> tuple:

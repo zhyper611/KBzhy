@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 
+from KBzhy.app.core.document_models import KnowledgeChunk
 from KBzhy.app.core.retriever import Retriever
 from KBzhy.app.core.splitter import Chunk
 
@@ -17,8 +18,9 @@ class FakeVectorStore:
             {"source": "third.md", "page": 1},
         ]
 
-    def add_documents(self, docs):
+    def add_documents(self, docs, ids=None):
         self.added_documents.extend(docs)
+        self.added_ids = list(ids or [])
 
     def get(self, where=None):
         if where == {"source": "policy.md"}:
@@ -36,6 +38,103 @@ def make_retriever(fake_vs):
     retriever._lock = threading.Lock()
     retriever._get_vectorstore = lambda kb_id: fake_vs
     return retriever
+
+
+def make_knowledge_chunk(chunk_id, *, chunk_type="child", version=2, position=0):
+    return KnowledgeChunk(
+        chunk_id=chunk_id,
+        document_id="doc-1",
+        document_version=version,
+        parent_chunk_id="parent-1" if chunk_type == "child" else None,
+        chunk_type=chunk_type,
+        content=f"content-{chunk_id}",
+        retrieval_text=f"Section\n\ncontent-{chunk_id}",
+        content_hash=f"hash-{chunk_id}",
+        section_path=("Section",),
+        page_start=1,
+        page_end=2,
+        position=position,
+        token_count=3,
+        index_version=1,
+        metadata={"source": "policy.md"},
+    )
+
+
+def test_stage_document_children_uses_stable_ids_and_only_indexes_children():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    children = [make_knowledge_chunk("child-1"), make_knowledge_chunk("child-2", position=1)]
+
+    retriever.stage_document_children("kb1", "doc-1", children)
+
+    assert fake_vs.added_ids == ["child-1", "child-2"]
+    assert [doc.page_content for doc in fake_vs.added_documents] == [
+        "Section\n\ncontent-child-1",
+        "Section\n\ncontent-child-2",
+    ]
+    assert fake_vs.added_documents[0].metadata["document_version"] == 2
+    assert fake_vs.added_documents[0].metadata["section_path"] == '["Section"]'
+
+
+def test_stage_document_children_is_idempotent_in_bm25():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    child = make_knowledge_chunk("child-1")
+
+    retriever.stage_document_children("kb1", "doc-1", [child])
+    retriever.stage_document_children("kb1", "doc-1", [child])
+
+    _, entries = retriever._bm25_indices["kb1"]
+    assert [entry["metadata"]["chunk_id"] for entry in entries] == ["child-1"]
+
+
+def test_remove_children_deletes_only_explicit_ids_from_both_indices():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    retriever.stage_document_children(
+        "kb1",
+        "doc-1",
+        [make_knowledge_chunk("child-1"), make_knowledge_chunk("child-2", position=1)],
+    )
+
+    retriever.remove_children("kb1", ["child-1"])
+
+    assert fake_vs.deleted_ids == ["child-1"]
+    _, entries = retriever._bm25_indices["kb1"]
+    assert [entry["metadata"]["chunk_id"] for entry in entries] == ["child-2"]
+
+
+def test_versioned_candidates_must_match_mysql_active_version():
+    retriever = Retriever.__new__(Retriever)
+    retriever._active_version_resolver = lambda doc_ids: {"doc-1": 2}
+    candidates = [
+        ("old", {"doc_id": "doc-1", "document_version": 1}, 0.9),
+        ("new", {"doc_id": "doc-1", "document_version": 2}, 0.8),
+        ("legacy-same-doc", {"doc_id": "doc-1"}, 0.75),
+        ("legacy", {"source": "legacy.md"}, 0.7),
+    ]
+
+    filtered = retriever._filter_active_candidates(candidates)
+
+    assert [item[0] for item in filtered] == ["new", "legacy"]
+
+
+def test_active_version_lookup_failure_drops_candidates_with_document_identity():
+    retriever = Retriever.__new__(Retriever)
+
+    def fail(_doc_ids):
+        raise RuntimeError("database unavailable")
+
+    retriever._active_version_resolver = fail
+    candidates = [
+        ("versioned", {"doc_id": "doc-1", "document_version": 2}, 0.9),
+        ("legacy-same-doc", {"doc_id": "doc-1"}, 0.8),
+        ("unregistered-legacy", {"source": "legacy.md"}, 0.7),
+    ]
+
+    filtered = retriever._filter_active_candidates(candidates)
+
+    assert [item[0] for item in filtered] == ["unregistered-legacy"]
 
 
 def test_remove_document_opens_persisted_vectorstore_when_not_cached():

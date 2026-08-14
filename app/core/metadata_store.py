@@ -1366,8 +1366,8 @@ class MySQLMetadataStore:
             conn.close()
 
     def set_indexing_phase(self, task_id: str, phase: str) -> bool:
-        if phase not in {"parsing", "indexing"}:
-            raise ValueError("indexing phase must be parsing or indexing")
+        if phase not in {"parsing", "chunking", "indexing"}:
+            raise ValueError("indexing phase must be parsing, chunking, or indexing")
         conn = self.create_connection()
         cur = None
         try:
@@ -1391,11 +1391,16 @@ class MySQLMetadataStore:
                 (task_id,),
             )
             task = cur.fetchone()
+            allowed_task_statuses = {
+                "parsing": {"parsing"},
+                "chunking": {"parsing"},
+                "indexing": {"parsing", "chunking"},
+            }[phase]
             if (
                 not task
                 or task.get("doc_id") != task_owner["doc_id"]
                 or task.get("kb_id") != task_owner["kb_id"]
-                or task.get("status") != "parsing"
+                or task.get("status") not in allowed_task_statuses
             ):
                 conn.commit()
                 return False
@@ -1406,11 +1411,12 @@ class MySQLMetadataStore:
             ):
                 conn.commit()
                 return False
-            if phase == "indexing":
+            if phase in {"chunking", "indexing"}:
+                current_task_status = task["status"]
                 cur.execute(
-                    "UPDATE document_index_tasks SET status='indexing', updated_at=%s "
-                    "WHERE task_id=%s AND status='parsing'",
-                    (datetime.now(), task_id),
+                    f"UPDATE document_index_tasks SET status='{phase}', updated_at=%s "
+                    "WHERE task_id=%s AND status=%s",
+                    (datetime.now(), task_id, current_task_status),
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("indexing task changed during phase transition")

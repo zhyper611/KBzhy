@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -32,6 +33,7 @@ from KBzhy.config import (
     READ_TIMEOUT,
     CHROMA_PERSIST_DIR,
 )
+from KBzhy.app.core.document_models import KnowledgeChunk
 from KBzhy.app.core.splitter import Chunk
 from KBzhy.app.core.timing import timed_stage
 
@@ -93,6 +95,7 @@ class Retriever:
         self._vectorstores: dict[str, Chroma] = {}
         # kb_id → (BM25Okapi, list[{content, metadata}])
         self._bm25_indices: dict[str, tuple[BM25Okapi | None, list[dict[str, Any]]]] = {}
+        self._active_version_resolver = self._load_active_versions
 
     # ── 知识库管理 ────────────────────────────────
 
@@ -208,6 +211,96 @@ class Retriever:
             self._bm25_indices[kb_id] = (None, bm25_docs)
             self._rebuild_bm25(kb_id)
         logger.info("知识库 %s 已索引 %d 个文本块", kb_id, len(chunks))
+
+    def stage_document_children(
+        self,
+        kb_id: str,
+        document_id: str,
+        new_children: list[KnowledgeChunk],
+    ) -> None:
+        if any(
+            chunk.chunk_type != "child" or chunk.document_id != document_id
+            for chunk in new_children
+        ):
+            raise ValueError("only children belonging to the target document may be staged")
+        if not new_children:
+            return
+
+        from langchain_core.documents import Document as LCDocument
+
+        ids = [chunk.chunk_id for chunk in new_children]
+        documents = []
+        entries = []
+        for chunk in new_children:
+            metadata = self._normalize_chroma_metadata(chunk.metadata)
+            metadata.update({
+                "kb_id": kb_id,
+                "chunk_id": chunk.chunk_id,
+                "doc_id": chunk.document_id,
+                "document_version": chunk.document_version,
+                "parent_chunk_id": chunk.parent_chunk_id or "",
+                "section_path": json.dumps(
+                    list(chunk.section_path), ensure_ascii=False, separators=(",", ":")
+                ),
+                "position": chunk.position,
+                "index_version": chunk.index_version,
+            })
+            if chunk.page_start is not None:
+                metadata["page_start"] = chunk.page_start
+                metadata.setdefault("page", chunk.page_start)
+            if chunk.page_end is not None:
+                metadata["page_end"] = chunk.page_end
+            documents.append(
+                LCDocument(page_content=chunk.retrieval_text, metadata=metadata)
+            )
+            entries.append({"content": chunk.retrieval_text, "metadata": metadata})
+
+        self._get_vectorstore(kb_id).add_documents(documents, ids=ids)
+        id_set = set(ids)
+        with self._lock:
+            _, existing = self._bm25_indices.get(kb_id, (None, []))
+            retained = [
+                entry
+                for entry in existing
+                if self._bm25_metadata(entry).get("chunk_id") not in id_set
+            ]
+            self._bm25_indices[kb_id] = (None, retained + entries)
+            self._rebuild_bm25(kb_id)
+
+    def remove_children(self, kb_id: str, chunk_ids: list[str]) -> None:
+        ids = list(dict.fromkeys(chunk_ids))
+        if not ids:
+            return
+        self._get_vectorstore(kb_id).delete(ids=ids)
+        id_set = set(ids)
+        with self._lock:
+            _, existing = self._bm25_indices.get(kb_id, (None, []))
+            retained = [
+                entry
+                for entry in existing
+                if self._bm25_metadata(entry).get("chunk_id") not in id_set
+            ]
+            if retained:
+                self._bm25_indices[kb_id] = (None, retained)
+                self._rebuild_bm25(kb_id)
+            else:
+                self._bm25_indices.pop(kb_id, None)
+
+    @staticmethod
+    def _normalize_chroma_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        normalized: dict[str, str | int | float | bool] = {}
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                normalized[str(key)] = value
+            elif isinstance(value, (dict, list, tuple)):
+                normalized[str(key)] = json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            else:
+                normalized[str(key)] = str(value)
+        return normalized
 
     def remove_document(
         self,
@@ -395,6 +488,22 @@ class Retriever:
         with timed_stage(logger, "bm25_search", request_id=request_id, kb_id=kb_id, k=fetch):
             bm25_results = self._bm25_search(query, kb_id, fetch)
 
+        versioned_candidates = vec_results + bm25_results
+        doc_ids = {
+            str(metadata.get("doc_id"))
+            for _, metadata, _ in versioned_candidates
+            if metadata.get("doc_id")
+        }
+        active_versions = None
+        if doc_ids:
+            try:
+                active_versions = self._active_version_resolver(sorted(doc_ids))
+            except Exception as exc:
+                logger.error("failed to resolve active document versions: %s", exc)
+                active_versions = {doc_id: -1 for doc_id in doc_ids}
+        vec_results = self._filter_active_candidates(vec_results, active_versions)
+        bm25_results = self._filter_active_candidates(bm25_results, active_versions)
+
         combined: dict[str, tuple[str, dict, float]] = {}
         for content, meta, score in vec_results:
             combined[content[:200]] = (content, meta, score * VECTOR_WEIGHT)
@@ -408,6 +517,53 @@ class Retriever:
 
         ranked = sorted(combined.values(), key=lambda x: x[2], reverse=True)
         return ranked[:fetch]
+
+    def _filter_active_candidates(
+        self,
+        candidates: list[tuple[str, dict, float]],
+        active_versions: dict[str, int] | None = None,
+    ) -> list[tuple[str, dict, float]]:
+        candidate_doc_ids = {
+            str(metadata.get("doc_id"))
+            for _, metadata, _ in candidates
+            if metadata.get("doc_id")
+        }
+        if not candidate_doc_ids:
+            return candidates
+        if active_versions is None:
+            try:
+                active_versions = self._active_version_resolver(sorted(candidate_doc_ids))
+            except Exception as exc:
+                logger.error("failed to resolve active document versions: %s", exc)
+                active_versions = {doc_id: -1 for doc_id in candidate_doc_ids}
+
+        filtered = []
+        for candidate in candidates:
+            metadata = candidate[1]
+            doc_id = metadata.get("doc_id")
+            version = metadata.get("document_version")
+            if not doc_id:
+                filtered.append(candidate)
+                continue
+            active_version = active_versions.get(str(doc_id))
+            if version is None:
+                if active_version is None:
+                    filtered.append(candidate)
+                continue
+            try:
+                candidate_version = int(version)
+            except (TypeError, ValueError):
+                continue
+            if active_version == candidate_version:
+                filtered.append(candidate)
+        return filtered
+
+    @staticmethod
+    def _load_active_versions(document_ids: list[str]) -> dict[str, int]:
+        from KBzhy.app.core.chunk_repository import ChunkRepository
+        from KBzhy.app.core.metadata_store import get_metadata_store
+
+        return ChunkRepository(get_metadata_store()).get_active_versions(document_ids)
 
     def _vector_search(self, query: str, kb_id: str, k: int) -> list[tuple[str, dict, float]]:
         """向量相似度检索"""

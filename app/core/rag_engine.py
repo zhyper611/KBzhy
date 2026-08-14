@@ -7,6 +7,8 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Generator
 
 import httpx
@@ -22,12 +24,25 @@ from KBzhy.config import (
     CHROMA_PERSIST_DIR,
 )
 from KBzhy.app.core.parser import DocumentParser
-from KBzhy.app.core.splitter import SmartSplitter
+from KBzhy.app.core.document_models import KnowledgeChunk, ParsedDocument
+from KBzhy.app.core.splitter import SmartSplitter, StructuralChunker
 from KBzhy.app.core.retriever import Retriever, _http_client
 from KBzhy.app.core.memory import MemoryManager
 from KBzhy.app.core.timing import timed_stage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedDocumentIndex:
+    chunks: tuple[KnowledgeChunk, ...]
+    artifact_path: str
+
+
+@dataclass(frozen=True)
+class ParsedDocumentArtifact:
+    parsed: ParsedDocument
+    artifact_path: str
 
 KNOWLEDGE_QA_SYSTEM_PROMPT = (
     "你是一个严谨的知识库问答助手。请严格遵循以下规则：\n"
@@ -66,6 +81,7 @@ class RAGEngine:
         self.llm_model = llm_model or LLM_MODEL
         self.parser = DocumentParser(vlm_model=self.llm_model)
         self.splitter = SmartSplitter()
+        self.structural_chunker = StructuralChunker()
         self.retriever = Retriever(
             persist_dir=self.persist_dir,
             embedding_model=embedding_model,
@@ -207,6 +223,80 @@ class RAGEngine:
             for doc in docs:
                 doc.metadata["task_id"] = task_id
         return self._index_docs(docs, kb_id, doc_id=doc_id, task_id=task_id)
+
+    def prepare_document_index(
+        self,
+        file_path: str,
+        kb_id: str,
+        *,
+        document_id: str,
+        document_version: int,
+        index_version: int,
+        display_name: str | None = None,
+    ) -> PreparedDocumentIndex:
+        parsed_artifact = self.parse_document_for_index(
+            file_path,
+            kb_id,
+            document_id=document_id,
+            document_version=document_version,
+            display_name=display_name,
+        )
+        return self.chunk_document_for_index(parsed_artifact, index_version=index_version)
+
+    def parse_document_for_index(
+        self,
+        file_path: str,
+        kb_id: str,
+        *,
+        document_id: str,
+        document_version: int,
+        display_name: str | None = None,
+    ) -> ParsedDocumentArtifact:
+        parsed = self.parser.parse_structured(
+            file_path,
+            document_id=document_id,
+            version=document_version,
+            kb_id=kb_id,
+        )
+        if display_name:
+            parsed = replace(
+                parsed,
+                metadata={**parsed.metadata, "source": display_name},
+            )
+        artifact_path = self.parser.save_artifact(parsed)
+        return ParsedDocumentArtifact(parsed, str(artifact_path))
+
+    def chunk_document_for_index(
+        self,
+        parsed_artifact: ParsedDocumentArtifact,
+        *,
+        index_version: int,
+    ) -> PreparedDocumentIndex:
+        chunks = self.structural_chunker.split(
+            parsed_artifact.parsed, index_version=index_version
+        )
+        return PreparedDocumentIndex(tuple(chunks), parsed_artifact.artifact_path)
+
+    def stage_document_children(
+        self,
+        kb_id: str,
+        document_id: str,
+        children: list[KnowledgeChunk],
+    ) -> None:
+        self.retriever.stage_document_children(kb_id, document_id, children)
+
+    def remove_children(self, kb_id: str, chunk_ids: list[str]) -> None:
+        self.retriever.remove_children(kb_id, chunk_ids)
+
+    def remove_parsed_artifact(self, artifact_path: str) -> None:
+        target = Path(artifact_path).resolve()
+        root = Path(self.parser._artifact_dir).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("parsed artifact path escapes artifact directory") from exc
+        if target.is_file():
+            target.unlink()
 
     def index_bytes(self, content: bytes, filename: str, kb_id: str) -> int:
         docs = self.parser.parse_bytes(content, filename)

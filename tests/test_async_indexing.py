@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from KBzhy.app.api import documents
 from KBzhy.app.core.indexing_worker import IndexingWorker
+from KBzhy.app.core.document_models import KnowledgeChunk, content_hash
 from KBzhy.app.core.metadata_store import MySQLMetadataStore
 
 
@@ -19,6 +21,26 @@ class FakeUploadFile:
 
     async def read(self):
         return self._content
+
+
+def make_structured_chunk(chunk_id, chunk_type, version=2):
+    content = chunk_id
+    return KnowledgeChunk(
+        chunk_id=chunk_id,
+        document_id="doc1",
+        document_version=version,
+        parent_chunk_id="parent-new" if chunk_type == "child" else None,
+        chunk_type=chunk_type,
+        content=content,
+        retrieval_text=content,
+        content_hash=content_hash(content),
+        section_path=(),
+        page_start=None,
+        page_end=None,
+        position=0,
+        token_count=1,
+        index_version=1,
+    )
 
 
 class InMemoryStore:
@@ -190,16 +212,20 @@ class InMemoryStore:
     def set_indexing_phase(self, task_id, phase):
         task = self.tasks[task_id]
         document = self.documents.get(task["doc_id"])
+        allowed_statuses = {
+            "parsing": {"parsing"},
+            "chunking": {"parsing"},
+            "indexing": {"parsing", "chunking"},
+        }
         if (
             not document
             or document.get("task_id") != task_id
             or document.get("status") == "deleting"
-            or task.get("status") != "parsing"
+            or task.get("status") not in allowed_statuses[phase]
         ):
             return False
         document.update(status=phase, error_message=None)
-        if phase == "indexing":
-            task["status"] = "indexing"
+        task["status"] = phase
         return True
 
     def update_document(self, doc_id, **changes):
@@ -1167,6 +1193,148 @@ def test_indexing_worker_skips_task_that_was_already_claimed(tmp_path):
 
     assert called is False
     assert store.documents["doc1"]["status"] == "queued"
+
+
+def test_structured_worker_stages_activates_then_cleans_old_children(tmp_path):
+    source = tmp_path / "doc.txt"
+    source.write_text("content", encoding="utf-8")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "doc.txt", "file_type": ".txt",
+        "status": "queued", "chunk_count": 0, "task_id": "task1",
+        "storage_path": str(source), "current_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "doc_id": "doc1", "version": 2, "filename": "doc.txt",
+        "storage_path": str(source), "status": "staging",
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    parent = KnowledgeChunk(
+        chunk_id="parent-new", document_id="doc1", document_version=2,
+        parent_chunk_id=None, chunk_type="parent", content="parent",
+        retrieval_text="parent", content_hash=content_hash("parent"), section_path=(),
+        page_start=None, page_end=None, position=0, token_count=1, index_version=1,
+    )
+    child = KnowledgeChunk(
+        chunk_id="child-new", document_id="doc1", document_version=2,
+        parent_chunk_id="parent-new", chunk_type="child", content="child",
+        retrieval_text="child", content_hash=content_hash("child"), section_path=(),
+        page_start=None, page_end=None, position=0, token_count=1, index_version=1,
+    )
+    events = []
+
+    class Repository:
+        def list_active_children(self, document_id):
+            return [SimpleNamespace(chunk_id="child-old")]
+
+        def replace_staging(self, task_id, document_id, version, chunks, parsed_artifact_path=None):
+            events.append(("mysql-stage", [item.chunk_id for item in chunks], parsed_artifact_path))
+
+        def activate_version(self, document_id, version, task_id):
+            events.append(("activate", document_id, version, task_id))
+            store.tasks[task_id]["status"] = "ready"
+            store.documents[document_id].update(status="ready", current_version=version)
+            store.versions[(document_id, version)]["status"] = "active"
+
+        def discard_task(self, task_id):
+            events.append(("discard", task_id))
+
+    class Engine:
+        def parse_document_for_index(self, *args, **kwargs):
+            assert store.tasks["task1"]["status"] == "parsing"
+            events.append(("parse", kwargs["document_version"]))
+            return SimpleNamespace(artifact_path="parsed/v2.json")
+
+        def chunk_document_for_index(self, parsed_artifact, *, index_version):
+            assert store.tasks["task1"]["status"] == "chunking"
+            events.append(("chunk", index_version))
+            return SimpleNamespace(chunks=(parent, child), artifact_path=parsed_artifact.artifact_path)
+
+        def stage_document_children(self, kb_id, document_id, children):
+            events.append(("vector-stage", [item.chunk_id for item in children]))
+
+        def remove_children(self, kb_id, chunk_ids):
+            events.append(("remove", list(chunk_ids)))
+
+    worker = IndexingWorker(
+        store=store, engine_factory=lambda: Engine(), autostart=False,
+        chunk_repository=Repository(),
+    )
+    worker.process_task("task1")
+
+    assert events == [
+        ("parse", 2),
+        ("chunk", 1),
+        ("mysql-stage", ["parent-new", "child-new"], "parsed/v2.json"),
+        ("vector-stage", ["child-new"]),
+        ("activate", "doc1", 2, "task1"),
+        ("remove", ["child-old"]),
+    ]
+    assert store.documents["doc1"]["status"] == "ready"
+
+
+def test_structured_worker_stage_failure_cleans_new_ids_but_keeps_old_active(tmp_path):
+    source = tmp_path / "doc.txt"
+    source.write_text("content", encoding="utf-8")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "filename": "doc.txt", "file_type": ".txt",
+        "status": "queued", "chunk_count": 4, "task_id": "task1",
+        "storage_path": str(source), "current_version": 1,
+    }
+    store.versions[("doc1", 2)] = {
+        "doc_id": "doc1", "version": 2, "filename": "doc.txt",
+        "storage_path": str(source), "status": "staging",
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1", "status": "queued",
+        "document_version": 2, "index_version": 1,
+    }
+    parent = make_structured_chunk("parent-new", "parent")
+    child = make_structured_chunk("child-new", "child")
+    removed = []
+    discarded = []
+
+    class Repository:
+        def list_active_children(self, document_id):
+            return [SimpleNamespace(chunk_id="child-old")]
+
+        def replace_staging(self, *args, **kwargs):
+            pass
+
+        def activate_version(self, *args):
+            raise AssertionError("failed vector stage must not activate")
+
+        def discard_task(self, task_id):
+            discarded.append(task_id)
+
+    class Engine:
+        def parse_document_for_index(self, *args, **kwargs):
+            return SimpleNamespace(artifact_path="parsed/v2.json")
+
+        def chunk_document_for_index(self, parsed_artifact, *, index_version):
+            return SimpleNamespace(chunks=(parent, child), artifact_path=parsed_artifact.artifact_path)
+
+        def stage_document_children(self, *args):
+            raise RuntimeError("embedding failed")
+
+        def remove_children(self, kb_id, chunk_ids):
+            removed.append(list(chunk_ids))
+
+    worker = IndexingWorker(
+        store=store, engine_factory=lambda: Engine(), autostart=False,
+        chunk_repository=Repository(),
+    )
+    worker.process_task("task1")
+
+    assert removed == [["child-new"]]
+    assert discarded == ["task1"]
+    assert "child-old" not in removed[0]
+    assert store.documents["doc1"]["current_version"] == 1
+    assert store.tasks["task1"]["status"] == "failed"
 
 
 def test_legacy_json_metadata_migration_imports_kbs_and_documents(monkeypatch, tmp_path):

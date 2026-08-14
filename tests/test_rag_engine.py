@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 from contextlib import nullcontext
+from pathlib import Path
 from fastapi import HTTPException
 
 from KBzhy.app.api import chat
@@ -140,6 +141,42 @@ def test_index_docs_adds_doc_and_task_metadata_to_chunks():
     assert engine.retriever.chunks[0].metadata["doc_id"] == "doc1"
     assert engine.retriever.chunks[0].metadata["task_id"] == "task1"
     assert engine.retriever.chunks[0].metadata["chunk_index"] == 1
+
+
+def test_prepare_document_index_uses_structured_parser_and_chunker(tmp_path):
+    from KBzhy.app.core.document_models import ParsedDocument
+
+    parsed = ParsedDocument(
+        document_id="doc1", version=2, title="source", language="und",
+        metadata={"kb_id": "kb1", "source": "source.md"},
+    )
+
+    class Parser:
+        def parse_structured(self, path, *, document_id, version, kb_id):
+            assert (path, document_id, version, kb_id) == ("source.md", "doc1", 2, "kb1")
+            return parsed
+
+        def save_artifact(self, value):
+            assert value.metadata["source"] == "display.md"
+            return tmp_path / "v2.json"
+
+    class Chunker:
+        def split(self, value, index_version):
+            assert value.metadata["source"] == "display.md"
+            assert index_version == 3
+            return ["parent", "child"]
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.parser = Parser()
+    engine.structural_chunker = Chunker()
+
+    prepared = engine.prepare_document_index(
+        "source.md", "kb1", document_id="doc1", document_version=2,
+        index_version=3, display_name="display.md",
+    )
+
+    assert prepared.chunks == ("parent", "child")
+    assert prepared.artifact_path == str(Path(tmp_path / "v2.json"))
 
 
 def test_prepare_query_skips_rewrite_for_clear_question_by_default():
