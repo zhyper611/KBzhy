@@ -243,7 +243,7 @@ Vite 已配置 `/api` 代理到 `http://127.0.0.1:8000`，开发时前端无需�
 | `RRF_CANDIDATE_K` | `40` | RRF 融合后保留的候选数 |
 | `RERANK_CANDIDATE_K` | `30` | 送入重排序的宽候选数 |
 | `MODEL_RERANK_THRESHOLD` | `0.35` | 模型重排序最低分；默认与相似度阈值一致 |
-| `KEYWORD_RERANK_THRESHOLD` | `0` | 关键词回退重排序最低分 |
+| `KEYWORD_RERANK_THRESHOLD` | `0.01` | 模型重排不可用时的关键词最低分；设为 `0` 会放行零关键词信号，降低拒答严格度 |
 | `CONTEXT_PER_DOCUMENT_LIMIT` | `3` | 单文档最多进入上下文的候选族数量 |
 | `CONTEXT_NEIGHBOR_WINDOW` | `1` | 命中 Child 两侧加载的邻居数量 |
 | `CONTEXT_SINGLE_SOURCE_TOKEN_BUDGET` | `2000` | 单来源可占用的最大 token 预算 |

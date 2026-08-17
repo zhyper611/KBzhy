@@ -64,7 +64,7 @@ RRF_K = int(os.getenv("RRF_K", "60"))
 RRF_CANDIDATE_K = int(os.getenv("RRF_CANDIDATE_K", "40"))
 RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", "30"))
 MODEL_RERANK_THRESHOLD = float(os.getenv("MODEL_RERANK_THRESHOLD", str(SIMILARITY_THRESHOLD)))
-KEYWORD_RERANK_THRESHOLD = float(os.getenv("KEYWORD_RERANK_THRESHOLD", "0"))
+KEYWORD_RERANK_THRESHOLD = float(os.getenv("KEYWORD_RERANK_THRESHOLD", "0.01"))
 
 # ====== 对话参数 ======
 MAX_CONTEXT_ROUNDS = 10  # Redis 热层保留最近 N 轮

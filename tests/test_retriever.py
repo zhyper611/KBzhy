@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+from KBzhy.config import KEYWORD_RERANK_THRESHOLD
 from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate, RerankResult
 from KBzhy.app.core.retriever import Retriever, rrf_fuse
 from KBzhy.app.core.splitter import Chunk
@@ -376,6 +377,29 @@ def test_keyword_fallback_does_not_use_request_model_threshold():
     )
 
     assert [item.chunk_id for item in result] == ["a"]
+
+
+def test_keyword_fallback_default_threshold_rejects_zero_signal():
+    assert KEYWORD_RERANK_THRESHOLD == 0.01
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = KEYWORD_RERANK_THRESHOLD
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [
+        make_candidate("zero", rrf_score=0.1)
+    ]
+    retriever._rerank = lambda query, candidates, method: RerankResult(
+        (replace(candidates[0], rerank_score=0.0),), "keyword", False
+    )
+
+    result = retriever.retrieve(
+        "query", "kb1", threshold=0.99,
+        enable_expansion=False, enable_decomposition=False,
+    )
+
+    assert result == []
 
 
 def test_model_failure_with_no_keyword_signal_preserves_rrf_order():
