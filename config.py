@@ -8,10 +8,22 @@ def _absolute_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _find_nearest_env_file(start_dir: str) -> str:
+    current_dir = _absolute_path(start_dir)
+    while True:
+        candidate = os.path.join(current_dir, ".env")
+        if os.path.isfile(candidate):
+            return candidate
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            return ""
+        current_dir = parent_dir
+
+
 def _load_environment(project_dir: str) -> None:
-    project_env_file = os.path.join(project_dir, ".env")
-    project_environment = dotenv_values(project_env_file)
-    shared_env_file = os.getenv("KBZHY_ENV_FILE") or project_environment.get(
+    default_env_file = _find_nearest_env_file(project_dir)
+    default_environment = dotenv_values(default_env_file) if default_env_file else {}
+    shared_env_file = os.getenv("KBZHY_ENV_FILE") or default_environment.get(
         "KBZHY_ENV_FILE"
     )
     if shared_env_file:
@@ -19,13 +31,16 @@ def _load_environment(project_dir: str) -> None:
 
     storage_root = (
         os.getenv("KBZHY_STORAGE_ROOT")
-        or project_environment.get("KBZHY_STORAGE_ROOT")
+        or default_environment.get("KBZHY_STORAGE_ROOT")
         or project_dir
     )
     storage_env_file = os.path.join(_absolute_path(storage_root), ".env")
-    if os.path.normcase(storage_env_file) != os.path.normcase(project_env_file):
+    if not default_env_file or os.path.normcase(storage_env_file) != os.path.normcase(
+        default_env_file
+    ):
         load_dotenv(storage_env_file, override=False)
-    load_dotenv(project_env_file, override=False)
+    if default_env_file:
+        load_dotenv(default_env_file, override=False)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _load_environment(PROJECT_DIR)

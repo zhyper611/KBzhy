@@ -21,7 +21,20 @@ def test_shared_env_file_precedes_project_dotenv(monkeypatch, tmp_path):
 
     config._load_environment(str(project_dir))
 
-    assert os.environ["MYSQL_USER"] == "shared-user"
+    assert os.getenv("MYSQL_USER") == "shared-user"
+
+
+def test_parent_dotenv_remains_the_lowest_priority_fallback(monkeypatch, tmp_path):
+    project_dir = tmp_path / "nested" / "project"
+    project_dir.mkdir(parents=True)
+    (tmp_path / ".env").write_text("MYSQL_USER=parent-user\n", encoding="utf-8")
+    monkeypatch.delenv("KBZHY_ENV_FILE", raising=False)
+    monkeypatch.delenv("KBZHY_STORAGE_ROOT", raising=False)
+    monkeypatch.delenv("MYSQL_USER", raising=False)
+
+    config._load_environment(str(project_dir))
+
+    assert os.getenv("MYSQL_USER") == "parent-user"
 
 
 def test_storage_paths_follow_configured_root(monkeypatch, tmp_path):
