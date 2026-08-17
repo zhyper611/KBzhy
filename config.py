@@ -5,6 +5,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _configured_path(name: str, default: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.getenv(name, default)))
+
+
+STORAGE_ROOT = _configured_path("KBZHY_STORAGE_ROOT", PROJECT_DIR)
+load_dotenv(os.path.join(STORAGE_ROOT, ".env"), override=False)
+SHARED_ENV_FILE = os.getenv("KBZHY_ENV_FILE")
+if SHARED_ENV_FILE:
+    load_dotenv(_configured_path("KBZHY_ENV_FILE", SHARED_ENV_FILE), override=False)
+
 # ====== 阿里云百炼 API 配置 ======
 API_KEY = os.getenv("DASHSCOPE_API_KEY", os.getenv("OPENAI_API_KEY", "your-api-key"))
 API_BASE = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -30,16 +43,34 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "kbzhy")
 
 # ====== ChromaDB 配置 ======
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+CHROMA_PERSIST_DIR = _configured_path(
+    "KBZHY_CHROMA_PERSIST_DIR", os.path.join(STORAGE_ROOT, "chroma_db")
+)
 
 # ====== 路径 ======
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-FILE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations")
-UPLOAD_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploads")
+DATA_DIR = _configured_path("KBZHY_DATA_DIR", os.path.join(STORAGE_ROOT, "data"))
+FILE_STORAGE_DIR = _configured_path(
+    "KBZHY_FILE_STORAGE_DIR", os.path.join(DATA_DIR, "conversations")
+)
+UPLOAD_STORAGE_DIR = _configured_path(
+    "KBZHY_UPLOAD_STORAGE_DIR", os.path.join(DATA_DIR, "uploads")
+)
+PARSED_ARTIFACT_DIR = _configured_path(
+    "KBZHY_PARSED_ARTIFACT_DIR", os.path.join(DATA_DIR, "parsed")
+)
 
 # ====== 文档切分参数 ======
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
+PARENT_CHUNK_TOKENS = 2000
+CHILD_CHUNK_TOKENS = 400
+CONTEXT_TOKEN_BUDGET = 6000
+CONTEXT_PER_DOCUMENT_LIMIT = int(os.getenv("CONTEXT_PER_DOCUMENT_LIMIT", "3"))
+CONTEXT_NEIGHBOR_WINDOW = int(os.getenv("CONTEXT_NEIGHBOR_WINDOW", "1"))
+CONTEXT_SINGLE_SOURCE_TOKEN_BUDGET = int(
+    os.getenv("CONTEXT_SINGLE_SOURCE_TOKEN_BUDGET", "2000")
+)
+TOKEN_ENCODING = os.getenv("TOKEN_ENCODING", "cl100k_base")
 CHINESE_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", "、", " ", ""]
 
 # ====== 检索参数 ======
@@ -48,6 +79,13 @@ FETCH_K = 15  # MMR 候选数
 SIMILARITY_THRESHOLD = 0.35  # 低于此值拒答
 BM25_WEIGHT = 0.3  # BM25 权重
 VECTOR_WEIGHT = 0.7  # 向量权重
+VECTOR_FETCH_K = int(os.getenv("VECTOR_FETCH_K", "30"))
+BM25_FETCH_K = int(os.getenv("BM25_FETCH_K", "30"))
+RRF_K = int(os.getenv("RRF_K", "60"))
+RRF_CANDIDATE_K = int(os.getenv("RRF_CANDIDATE_K", "40"))
+RERANK_CANDIDATE_K = int(os.getenv("RERANK_CANDIDATE_K", "30"))
+MODEL_RERANK_THRESHOLD = float(os.getenv("MODEL_RERANK_THRESHOLD", str(SIMILARITY_THRESHOLD)))
+KEYWORD_RERANK_THRESHOLD = float(os.getenv("KEYWORD_RERANK_THRESHOLD", "0.01"))
 
 # ====== 对话参数 ======
 MAX_CONTEXT_ROUNDS = 10  # Redis 热层保留最近 N 轮

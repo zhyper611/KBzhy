@@ -4,11 +4,27 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from KBzhy.config import CHUNK_SIZE, CHUNK_OVERLAP, CHINESE_SEPARATORS
+from KBzhy.app.core.document_models import (
+    DocumentElement,
+    KnowledgeChunk,
+    ParsedDocument,
+    content_hash,
+    stable_chunk_id,
+)
+from KBzhy.app.core.token_counter import TokenCounter
+from KBzhy.config import (
+    CHILD_CHUNK_TOKENS,
+    CHINESE_SEPARATORS,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    PARENT_CHUNK_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +38,475 @@ class Chunk:
 
     def __repr__(self) -> str:
         return f"Chunk(len={len(self.content)})"
+
+
+@dataclass(frozen=True)
+class _ElementFragment:
+    element: DocumentElement
+    text: str
+
+
+@dataclass(frozen=True)
+class _ElementGroup:
+    fragments: tuple[_ElementFragment, ...]
+    section_path: tuple[str, ...]
+
+
+class StructuralChunker:
+    _MAX_ENCODING_WINDOW_CHARS = 4_096
+
+    """按章节和结构化 Element 生成 Parent-Child Chunk。"""
+
+    def __init__(
+        self,
+        child_token_limit: int = CHILD_CHUNK_TOKENS,
+        parent_token_limit: int = PARENT_CHUNK_TOKENS,
+        token_counter: TokenCounter | None = None,
+    ):
+        self._validate_limit(child_token_limit, "child_token_limit")
+        self._validate_limit(parent_token_limit, "parent_token_limit")
+        self.child_token_limit = child_token_limit
+        self.parent_token_limit = parent_token_limit
+        self.token_counter = token_counter or TokenCounter()
+
+    def split(
+        self,
+        parsed: ParsedDocument,
+        index_version: int,
+    ) -> list[KnowledgeChunk]:
+        if isinstance(index_version, bool) or not isinstance(index_version, int) or index_version <= 0:
+            raise ValueError("index_version must be a positive integer")
+
+        elements = [
+            element
+            for _, element in sorted(
+                enumerate(parsed.elements),
+                key=lambda item: (item[1].order, item[0]),
+            )
+            if element.text.strip()
+        ]
+        if not elements:
+            return []
+
+        chunks: list[KnowledgeChunk] = []
+        parent_position = 0
+        child_position = 0
+        for group in self._parent_groups(elements):
+            parent_content = self._join_fragments(group.fragments)
+            parent_id = stable_chunk_id(
+                parsed.document_id,
+                parsed.version,
+                parent_position,
+                f"parent\0{parent_content}",
+            )
+            page_start, page_end = self._page_range(group.fragments)
+            parent_metadata = self._metadata(parsed, group.fragments)
+            breadcrumb = " > ".join(group.section_path)
+            parent_retrieval_text = (
+                f"{breadcrumb}\n\n{parent_content}" if breadcrumb else parent_content
+            )
+            chunks.append(
+                KnowledgeChunk(
+                    chunk_id=parent_id,
+                    document_id=parsed.document_id,
+                    document_version=parsed.version,
+                    parent_chunk_id=None,
+                    chunk_type="parent",
+                    content=parent_content,
+                    retrieval_text=parent_retrieval_text,
+                    content_hash=content_hash(parent_content),
+                    section_path=group.section_path,
+                    page_start=page_start,
+                    page_end=page_end,
+                    position=parent_position,
+                    token_count=self.token_counter.count(parent_content),
+                    index_version=index_version,
+                    metadata=parent_metadata,
+                )
+            )
+
+            for child_content, child_fragments in self._child_groups(group.fragments):
+                child_page_start, child_page_end = self._page_range(child_fragments)
+                child_content_hash = content_hash(child_content)
+                breadcrumb = " > ".join(group.section_path)
+                child_retrieval_text = (
+                    f"{breadcrumb}\n\n{child_content}" if breadcrumb else child_content
+                )
+                chunks.append(
+                    KnowledgeChunk(
+                        chunk_id=stable_chunk_id(
+                            parsed.document_id,
+                            parsed.version,
+                            child_position,
+                            f"child\0{child_content}",
+                        ),
+                        document_id=parsed.document_id,
+                        document_version=parsed.version,
+                        parent_chunk_id=parent_id,
+                        chunk_type="child",
+                        content=child_content,
+                        retrieval_text=child_retrieval_text,
+                        content_hash=child_content_hash,
+                        section_path=group.section_path,
+                        page_start=child_page_start,
+                        page_end=child_page_end,
+                        position=child_position,
+                        token_count=self.token_counter.count(child_content),
+                        index_version=index_version,
+                        metadata=self._metadata(parsed, child_fragments),
+                    )
+                )
+                child_position += 1
+            parent_position += 1
+        return chunks
+
+    def _parent_groups(self, elements: list[DocumentElement]) -> list[_ElementGroup]:
+        groups: list[_ElementGroup] = []
+        current: list[_ElementFragment] = []
+        section_path: tuple[str, ...] | None = None
+
+        def close_current() -> None:
+            if current:
+                groups.append(_ElementGroup(tuple(current), section_path or ()))
+                current.clear()
+
+        for element in elements:
+            if section_path is not None and element.section_path != section_path:
+                close_current()
+            section_path = element.section_path
+            for text in self._split_element_text(
+                element.text,
+                element.element_type,
+                self.parent_token_limit,
+            ):
+                fragment = _ElementFragment(element, text)
+                candidate = (*current, fragment)
+                if (
+                    current
+                    and self._exceeds_limit(
+                        self._join_fragments(candidate),
+                        self.parent_token_limit,
+                    )
+                ):
+                    close_current()
+                current.append(fragment)
+        close_current()
+        return groups
+
+    def _child_groups(
+        self,
+        fragments: tuple[_ElementFragment, ...],
+    ) -> list[tuple[str, tuple[_ElementFragment, ...]]]:
+        groups: list[tuple[str, tuple[_ElementFragment, ...]]] = []
+        current: list[_ElementFragment] = []
+
+        def close_current() -> None:
+            if current:
+                groups.append((self._join_fragments(current), tuple(current)))
+                current.clear()
+
+        for source in fragments:
+            for text in self._split_element_text(
+                source.text,
+                source.element.element_type,
+                self.child_token_limit,
+            ):
+                fragment = _ElementFragment(source.element, text)
+                candidate = (*current, fragment)
+                if (
+                    current
+                    and self._exceeds_limit(
+                        self._join_fragments(candidate),
+                        self.child_token_limit,
+                    )
+                ):
+                    close_current()
+                current.append(fragment)
+        close_current()
+        return groups
+
+    def _split_element_text(
+        self,
+        text: str,
+        element_type: str,
+        limit: int,
+    ) -> list[str]:
+        units = self._semantic_units(text, element_type)
+        atomic_pieces = [
+            piece
+            for unit in units
+            for piece in self._fit_atomic_unit(unit, limit)
+        ]
+        pieces: list[str] = []
+        current = ""
+        for piece in atomic_pieces:
+            candidate = current + piece
+            if current and self._exceeds_limit(candidate, limit):
+                pieces.append(current)
+                current = piece
+            else:
+                current = candidate
+        if current:
+            pieces.append(current)
+        return pieces
+
+    @staticmethod
+    def _semantic_units(text: str, element_type: str) -> list[str]:
+        if element_type in {"code", "table", "list"}:
+            return text.splitlines(keepends=True) or [text]
+        units = re.split(r"(?<=[。！？!?；;])|(?<=\n)", text)
+        return [unit for unit in units if unit]
+
+    def _fit_atomic_unit(self, text: str, limit: int) -> list[str]:
+        return self._split_by_graphemes(text, limit)
+
+    def _split_by_graphemes(self, text: str, limit: int) -> list[str]:
+        if getattr(self.token_counter, "encoding", None) is not None:
+            return self._split_with_encoding_windows(text, limit)
+
+        source = iter(self._iter_graphemes(text))
+        buffer: list[str] = []
+        pieces: list[str] = []
+        exhausted = False
+        max_window_chars = self._MAX_ENCODING_WINDOW_CHARS
+
+        while buffer or not exhausted:
+            probe = 0
+            candidate = ""
+            last_fitting: int | None = None
+            consecutive_failures = 0
+
+            while consecutive_failures < 4:
+                if probe == len(buffer):
+                    try:
+                        buffer.append(next(source))
+                    except StopIteration:
+                        exhausted = True
+                        break
+                cluster = buffer[probe]
+                if len(cluster) > max_window_chars:
+                    raise ValueError(
+                        "a single Unicode grapheme exceeds the encoding window"
+                    )
+                if (
+                    candidate
+                    and last_fitting is not None
+                    and len(candidate) + len(cluster) > max_window_chars
+                ):
+                    break
+                candidate += cluster
+                probe += 1
+                if self.token_counter.count(candidate) <= limit:
+                    last_fitting = probe
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+            if last_fitting is None:
+                raise ValueError(
+                    "token limit is too small for a single Unicode character or grapheme"
+                )
+            pieces.append("".join(buffer[:last_fitting]))
+            del buffer[:last_fitting]
+        return pieces
+
+    def _split_with_encoding_windows(self, text: str, limit: int) -> list[str]:
+        source = iter(self._iter_graphemes(text))
+        pending: str | None = None
+        pieces: list[str] = []
+        exhausted = False
+
+        while pending is not None or not exhausted:
+            clusters: list[str] = []
+            window_chars = 0
+
+            if pending is not None:
+                cluster = pending
+                pending = None
+            else:
+                try:
+                    cluster = next(source)
+                except StopIteration:
+                    break
+
+            while True:
+                if len(cluster) > self._MAX_ENCODING_WINDOW_CHARS:
+                    raise ValueError(
+                        "a single Unicode grapheme exceeds the encoding window"
+                    )
+                if (
+                    clusters
+                    and window_chars + len(cluster) > self._MAX_ENCODING_WINDOW_CHARS
+                ):
+                    pending = cluster
+                    break
+                clusters.append(cluster)
+                window_chars += len(cluster)
+                try:
+                    cluster = next(source)
+                except StopIteration:
+                    exhausted = True
+                    break
+
+            pieces.extend(self._split_encoding_window(clusters, limit))
+
+        return pieces
+
+    def _split_encoding_window(self, clusters: list[str], limit: int) -> list[str]:
+        encoding = self.token_counter.encoding
+        pieces: list[str] = []
+        start = 0
+
+        while start < len(clusters):
+            candidate = "".join(clusters[start:])
+            tokens = encoding.encode(candidate, disallowed_special=())
+            if len(tokens) <= limit:
+                pieces.append(candidate)
+                break
+
+            prefix_bytes = b"".join(
+                encoding.decode_single_token_bytes(token)
+                for token in tokens[:limit]
+            )
+            prefix_length = len(prefix_bytes.decode("utf-8", errors="ignore"))
+            end = start
+            consumed_chars = 0
+            while end < len(clusters):
+                next_length = consumed_chars + len(clusters[end])
+                if next_length > prefix_length:
+                    break
+                consumed_chars = next_length
+                end += 1
+
+            if end == start:
+                first = clusters[start]
+                if self.token_counter.count(first) > limit:
+                    raise ValueError(
+                        "token limit is too small for a single Unicode character or grapheme"
+                    )
+                end += 1
+
+            piece = "".join(clusters[start:end])
+            while end > start and self.token_counter.count(piece) > limit:
+                end -= 1
+                piece = "".join(clusters[start:end])
+            if end == start:
+                raise ValueError(
+                    "token limit is too small for a single Unicode character or grapheme"
+                )
+            pieces.append(piece)
+            start = end
+
+        return pieces
+
+    def _exceeds_limit(self, text: str, limit: int) -> bool:
+        if (
+            getattr(self.token_counter, "encoding", None) is not None
+            and len(text) > self._MAX_ENCODING_WINDOW_CHARS
+        ):
+            return True
+        return self.token_counter.count(text) > limit
+
+    @staticmethod
+    def _graphemes(text: str) -> list[str]:
+        return list(StructuralChunker._iter_graphemes(text))
+
+    @staticmethod
+    def _iter_graphemes(text: str):
+        if not text:
+            return
+
+        start = 0
+        previous = text[0]
+        regional_count = 1 if StructuralChunker._is_regional_indicator(previous) else 0
+        for index in range(1, len(text)):
+            character = text[index]
+            is_regional = StructuralChunker._is_regional_indicator(character)
+            joins_previous = (
+                StructuralChunker._is_grapheme_extension(character)
+                or character == "\u200d"
+                or previous == "\u200d"
+                or (is_regional and regional_count % 2 == 1)
+            )
+            if not joins_previous:
+                yield text[start:index]
+                start = index
+                regional_count = 0
+
+            if is_regional:
+                regional_count += 1
+            elif not StructuralChunker._is_grapheme_extension(character):
+                regional_count = 0
+            previous = character
+        yield text[start:]
+
+    @staticmethod
+    def _is_grapheme_extension(character: str) -> bool:
+        return (
+            unicodedata.combining(character) != 0
+            or unicodedata.category(character) in {"Mc", "Me", "Mn"}
+            or "\ufe00" <= character <= "\ufe0f"
+            or "\U000e0100" <= character <= "\U000e01ef"
+            or "\U0001f3fb" <= character <= "\U0001f3ff"
+            or "\U000e0020" <= character <= "\U000e007f"
+        )
+
+    @staticmethod
+    def _is_regional_indicator(character: str) -> bool:
+        return "\U0001f1e6" <= character <= "\U0001f1ff"
+
+    @staticmethod
+    def _join_fragments(
+        fragments: list[_ElementFragment] | tuple[_ElementFragment, ...],
+    ) -> str:
+        content = ""
+        previous: DocumentElement | None = None
+        for fragment in fragments:
+            if content and previous is not fragment.element:
+                content += "\n\n"
+            content += fragment.text
+            previous = fragment.element
+        return content
+
+    @staticmethod
+    def _page_range(
+        fragments: tuple[_ElementFragment, ...],
+    ) -> tuple[int | None, int | None]:
+        pages = [
+            fragment.element.page
+            for fragment in fragments
+            if fragment.element.page is not None
+        ]
+        return (min(pages), max(pages)) if pages else (None, None)
+
+    @staticmethod
+    def _metadata(
+        parsed: ParsedDocument,
+        fragments: tuple[_ElementFragment, ...],
+    ) -> dict[str, Any]:
+        elements: list[DocumentElement] = []
+        for fragment in fragments:
+            if not elements or elements[-1] is not fragment.element:
+                elements.append(fragment.element)
+        metadata = dict(parsed.metadata)
+        metadata.update(
+            {
+                "element_ids": [element.element_id for element in elements],
+                "element_types": [element.element_type for element in elements],
+                "element_metadata": [dict(element.metadata) for element in elements],
+            }
+        )
+        table_elements = [element for element in elements if element.element_type == "table"]
+        if len(table_elements) == 1:
+            lines = table_elements[0].text.splitlines()
+            if lines:
+                metadata["table_header"] = lines[0]
+        return metadata
+
+    @staticmethod
+    def _validate_limit(value: int, name: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
 
 
 class SmartSplitter:
@@ -42,12 +527,6 @@ class SmartSplitter:
         r"^\s*(?:第[一二三四五六七八九十百千\d]+[条章节款]|[\(（]?\d+[\)）\.\、])"
     )
 
-    # 表格行特征：| 分隔
-    _TABLE_PATTERN = re.compile(r"\|.+\|")
-
-    # 代码块特征
-    _CODE_PATTERN = re.compile(r"```[\s\S]*?```")
-
     # 列表特征
     _LIST_PATTERN = re.compile(r"(?:^|\n)(?:\d+[\.\)、]|[-*+•])[ \t]+[^\n]+")
 
@@ -65,9 +544,6 @@ class SmartSplitter:
         """按文档类型选择策略切分"""
         meta = metadata or {}
         meta["doc_type"] = doc_type
-
-        # 预处理：标记结构化内容
-        content = self._mark_structured(content)
 
         if doc_type == "excel":
             chunks = self._split_by_rows(content, meta)
@@ -102,33 +578,6 @@ class SmartSplitter:
             if len(self._CLAUSE_PATTERN.findall(content)) >= 5:
                 return "clause"
         return "default"
-
-    # ── 标记结构化内容 ─────────────────────────
-
-    def _mark_structured(self, content: str) -> str:
-        """给表格/代码块加特殊标记，防止被切碎"""
-        # 代码块标记为原子单元
-        content = self._CODE_PATTERN.sub(
-            lambda m: m.group().replace("\n", "␤"), content
-        )
-        # 表格标记为原子单元
-        table_lines: list[str] = []
-        result: list[str] = []
-        in_table = False
-        for line in content.split("\n"):
-            if self._TABLE_PATTERN.match(line):
-                if not in_table:
-                    in_table = True
-                    table_lines = []
-                table_lines.append(line)
-            else:
-                if in_table:
-                    in_table = False
-                    result.append("␟TABLE␟" + "␤".join(table_lines) + "␟TABLE_END␟")
-                result.append(line)
-        if in_table:
-            result.append("␟TABLE␟" + "␤".join(table_lines) + "␟TABLE_END␟")
-        return "\n".join(result)
 
     # ── 按段落切分（Word/PDF）───────────────────
 

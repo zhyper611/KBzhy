@@ -8,7 +8,7 @@
 [![MySQL](https://img.shields.io/badge/MySQL-Persistence-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
 [![Redis](https://img.shields.io/badge/Redis-Hot_Cache-DC382D?logo=redis&logoColor=white)](https://redis.io/)
 [![RAG](https://img.shields.io/badge/RAG-Hybrid_Retrieval-1677FF)](#rag-流程)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](LICENSE)
 
 > 面向 RAG 实训、原型验证与企业知识库场景的全栈智能问答系统：**FastAPI API + React 控制台 + ChromaDB 混合检索 + MySQL 持久化 + Redis 会话热缓存**。
 
@@ -17,10 +17,11 @@ KBzhy 是一个面向实训、原型验证和企业知识库场景的全栈 RAG 
 ## 功能特性
 
 - 知识库管理：支持创建、查看、删除多个知识库，并按知识库隔离向量数据。
-- 多格式文档解析：支持 PDF、Word、Excel、PPT、TXT、Markdown、CSV 和图片 OCR。
-- 智能文本分块：针对段落、表格、FAQ、条款、Excel 行数据等内容采用不同切分策略。
-- 混合检索：结合 ChromaDB 向量检索、BM25 关键词检索、MMR 多样性选择提升召回质量。
-- 多种重排序策略：支持模型 rerank、LLM 打分 rerank、关键词回退 rerank。
+- 多格式文档解析：PDF、Word、Markdown、TXT 采用结构化解析；Excel、PPT、CSV 和图片 OCR 保留兼容解析链路。
+- 父子分块：按章节与元素边界生成 Parent/Child，检索 Child、组装 Parent 上下文，保留页码和结构路径。
+- 混合检索：并发执行 ChromaDB 向量召回与 BM25 关键词召回，用 RRF 按 `chunk_id` 去重融合。
+- 宽召回重排序：默认从融合候选中取 Top 30 做模型 rerank，失败时回退关键词评分，并使用独立阈值过滤。
+- 安全索引切换：文档版本先写 staging，成功后原子激活；知识库重索引先构建临时 collection，全部成功后再切换指针。
 - 查询增强：支持查询扩展、复杂问题子问题拆解、多轮上下文查询改写。
 - 严谨回答控制：内置知识库问答系统提示词，证据不足时拒答，减少无依据生成。
 - 溯源与幻觉标记：回答返回来源片段，并对可能缺少证据支撑的句子做提示。
@@ -35,7 +36,7 @@ KBzhy 是一个面向实训、原型验证和企业知识库场景的全栈 RAG 
 | 前端 | React 18、Vite 5、Ant Design 5 | 知识库管理、文档上传、流式问答与检索参数配置 |
 | API | Python 3.10+、FastAPI、Uvicorn、Pydantic | REST/SSE 接口、请求校验与 RAG 流程编排 |
 | 模型接入 | OpenAI Python SDK、httpx | 调用兼容 OpenAI 协议的 LLM、Embedding 与 Rerank 服务 |
-| 检索 | LangChain Chroma、ChromaDB、rank-bm25、jieba | 向量检索、关键词检索、MMR 与混合召回 |
+| 检索 | LangChain Chroma、ChromaDB、rank-bm25、jieba | 向量/BM25 并发召回、RRF 融合、宽候选重排与父级上下文组装 |
 | 文档解析 | PyMuPDF、python-docx、openpyxl、python-pptx | PDF、Word、Excel、PPT 等多格式内容解析 |
 | 持久化 | MySQL | 存储知识库、文档、索引任务元数据及完整对话记录 |
 | 热缓存 | Redis（可选） | 缓存最近会话上下文和会话元数据；不可用时回退本地文件 |
@@ -60,18 +61,22 @@ flowchart LR
     API --> KB["知识库与文档 API"]
     API --> Chat["聊天与会话 API"]
 
-    KB --> Parser["DocumentParser<br/>多格式解析"]
-    Parser --> Splitter["SmartSplitter<br/>智能分块"]
-    Splitter --> Retriever["Retriever<br/>索引写入"]
+    KB --> Parser["Structured Parser<br/>结构化解析"]
+    Parser --> Splitter["StructuralChunker<br/>Parent / Child 分块"]
+    Splitter --> Indexer["Indexing Worker<br/>版本化 staging / 激活"]
 
     Chat --> Engine["RAGEngine<br/>流程编排"]
     Engine --> Retriever
+    Retriever --> Context["ContextAssembler<br/>Parent / 邻居 / 配额"]
+    Context --> Engine
     Engine --> Memory["MemoryManager<br/>会话记忆"]
     KB --> MySQL["MySQL<br/>元数据与任务"]
     Memory --> Redis["Redis<br/>会话热缓存"]
     Memory --> MySQL
 
-    Retriever --> Chroma["ChromaDB<br/>向量库"]
+    Indexer --> MySQL
+    Indexer --> Chroma["ChromaDB<br/>版本化 collection"]
+    Retriever --> Chroma
     Retriever --> BM25["BM25<br/>关键词索引"]
     Retriever --> Rerank["Reranker<br/>重排序"]
 
@@ -91,10 +96,18 @@ KBzhy/
 │   ├── core/
 │   │   ├── engine.py            # RAGEngine 单例入口
 │   │   ├── memory.py            # 会话记忆管理
-│   │   ├── parser.py            # 多格式文档解析
+│   │   ├── document_models.py   # 文档、元素与 Parent/Child 数据模型
+│   │   ├── parser.py            # 结构化解析入口与解析产物存取
+│   │   ├── parsers/             # PDF、Word、Markdown、TXT 专用解析器
 │   │   ├── rag_engine.py        # RAG 主流程编排
-│   │   ├── retriever.py         # 混合检索、MMR、rerank、查询增强
-│   │   ├── splitter.py          # 智能文本分块
+│   │   ├── retriever.py         # 向量/BM25 召回、RRF 融合与 rerank
+│   │   ├── splitter.py          # 结构化 Parent/Child 分块
+│   │   ├── chunk_repository.py  # 分块 staging、版本激活与上下文族读取
+│   │   ├── context_assembler.py # Parent、邻居、文档配额与 token 预算
+│   │   ├── indexing_worker.py   # 异步索引与故障恢复
+│   │   ├── metadata_store.py    # MySQL 元数据、版本与任务事务
+│   │   ├── reindex_service.py   # 知识库安全重索引服务与 CLI
+│   │   ├── token_counter.py     # 统一 token 计数
 │   │   └── timing.py            # 性能阶段日志
 │   └── models/
 │       └── schemas.py           # Pydantic 请求和响应模型
@@ -223,16 +236,44 @@ Vite 已配置 `/api` 代理到 `http://127.0.0.1:8000`，开发时前端无需�
 | `RERANKER_MODEL` | `qwen3-vl-rerank` | 专用重排序模型 |
 | `TEMPERATURE` | `0.5` | 默认生成温度 |
 | `RERANK_METHOD` | `model` | 默认重排序策略：`model` / `llm` / `keyword` |
+| `TOKEN_ENCODING` | `cl100k_base` | 分块与上下文预算使用的 token 编码 |
+| `VECTOR_FETCH_K` | `30` | 向量召回候选数 |
+| `BM25_FETCH_K` | `30` | BM25 召回候选数 |
+| `RRF_K` | `60` | RRF 排名平滑常数 |
+| `RRF_CANDIDATE_K` | `40` | RRF 融合后保留的候选数 |
+| `RERANK_CANDIDATE_K` | `30` | 送入重排序的宽候选数 |
+| `MODEL_RERANK_THRESHOLD` | `0.35` | 模型重排序最低分；默认与相似度阈值一致 |
+| `KEYWORD_RERANK_THRESHOLD` | `0.01` | 模型重排不可用时的关键词最低分；设为 `0` 会放行零关键词信号，降低拒答严格度 |
+| `CONTEXT_PER_DOCUMENT_LIMIT` | `3` | 单文档最多进入上下文的候选族数量 |
+| `CONTEXT_NEIGHBOR_WINDOW` | `1` | 命中 Child 两侧加载的邻居数量 |
+| `CONTEXT_SINGLE_SOURCE_TOKEN_BUDGET` | `2000` | 单来源可占用的最大 token 预算 |
 | `REDIS_HOST` | `localhost` | Redis 主机 |
 | `REDIS_PORT` | `6379` | Redis 端口 |
 | `REDIS_DB` | `0` | Redis 数据库编号 |
 | `REDIS_PASSWORD` | 空 | Redis 密码 |
-| `REDIS_TTL` | `1800` | Redis 会话过期时间 |
+| `REDIS_TTL` | `86400` | Redis 会话过期时间 |
 | `MYSQL_HOST` | `localhost` | MySQL 主机；知识库与文档管理依赖该数据库 |
 | `MYSQL_PORT` | `3306` | MySQL 端口 |
 | `MYSQL_USER` | `root` | MySQL 用户 |
 | `MYSQL_PASSWORD` | 空 | MySQL 密码 |
 | `MYSQL_DATABASE` | `kbzhy` | MySQL 数据库名 |
+| `KBZHY_STORAGE_ROOT` | 项目目录 | Chroma、上传文件、解析产物和文件会话的统一持久化根目录；使用 Git worktree 时应指向稳定目录 |
+| `KBZHY_ENV_FILE` | 空 | 多个 worktree 共用的运行配置文件路径；显式系统环境变量仍优先 |
+| `KBZHY_CHROMA_PERSIST_DIR` | `<存储根>/chroma_db` | 单独覆盖 ChromaDB 目录 |
+| `KBZHY_DATA_DIR` | `<存储根>/data` | 单独覆盖数据目录，其余文件目录默认从这里派生 |
+
+### Git worktree 与共享存储
+
+默认情况下，ChromaDB、上传文件和解析产物会写入当前项目目录。使用 Git worktree 开发时，每个 worktree 都有独立目录；如果不显式配置，切换 worktree 后会表现为知识库元数据仍在 MySQL 中，但本地文件或向量索引不可见。
+
+建议让所有 worktree 指向同一个稳定的持久化目录，并可选共享同一份运行配置：
+
+```env
+KBZHY_STORAGE_ROOT=C:/data/kbzhy
+KBZHY_ENV_FILE=C:/data/kbzhy/.env
+```
+
+路径建议使用绝对路径。显式设置的系统环境变量优先于 `KBZHY_ENV_FILE` 和存储根目录中的 `.env`。API 进程与索引 Worker 必须使用相同的 MySQL 配置和 `KBZHY_STORAGE_ROOT`，否则可能出现任务已创建但 Worker 查不到任务，或索引完成后查询不到向量数据的情况。
 
 ## 核心 API
 
@@ -314,15 +355,53 @@ POST /api/chat/{session_id}/stream
 
 ## RAG 流程
 
-1. 文档解析：按文件类型提取文本、表格、页码、Sheet、幻灯片等元数据。
-2. 智能分块：按文档结构选择段落、行、FAQ、条款或递归字符切分。
-3. 索引写入：将分块写入 ChromaDB，并同步构建 BM25 内存索引。
+1. 结构化解析：PDF、Word、Markdown、TXT 输出统一 Element，并保存可复用的解析产物；其余格式走兼容适配器。
+2. 父子分块：按章节生成 Parent，按元素语义边界生成 Child；超长元素才做 token 安全硬切。
+3. 版本化索引：新版本先进入 staging，向量与 MySQL 分块均成功后再原子切换 active 版本。
 4. 查询准备：多轮场景下按需改写问题，复杂问题可拆解为子问题。
-5. 混合召回：向量相似度和 BM25 关键词召回加权融合。
-6. MMR 筛选：在相关性和多样性之间平衡，降低重复片段。
-7. Rerank 重排：优先使用模型 rerank，失败后自动回退关键词评分。
-8. 生成回答：根据 `stuff`、`map_reduce` 或 `refine` 策略组织上下文。
-9. 溯源与检查：返回来源片段，并用关键词覆盖率做轻量幻觉提示。
+5. 混合召回：在当前 active collection 上并发执行向量与 BM25 召回，只接收 active 文档版本。
+6. RRF 融合：按排名融合并用稳定的 `chunk_id` 去重，避免不同评分尺度直接相加。
+7. 宽候选重排：对融合后的 Top 30 优先使用模型 rerank，调用失败时回退关键词评分。
+8. 上下文组装：围绕命中 Child 读取 Parent 和相邻 Child，执行文档配额、去重与 token 预算控制。
+9. 生成回答：根据 `stuff`、`map_reduce` 或 `refine` 策略使用组装后的证据上下文回答。
+10. 溯源与检查：来源仍对应原始检索候选；阈值和系统提示词负责证据不足拒答，关键词覆盖率提供轻量幻觉提示。
+
+文档向量化会按每批最多 10 条文本调用默认百炼 Embedding 服务，并保持结果顺序，因此较大的文档无需手动缩小分块数量来规避服务端批量上限。
+
+### 重复上传与版本语义
+
+- 同一知识库上传相同内容时返回 `409`，不会重复构建索引。
+- 更新文档但内容哈希未变化时按幂等成功处理，不创建新版本。
+- 相同文件可以上传到不同知识库，各知识库独立维护文档、版本和 collection。
+- 文档任务依次经过 `queued → parsing → chunking → indexing → ready`；失败任务保留明确状态与错误信息。
+
+### 安全重索引
+
+重索引当前只提供运维 CLI，不开放 HTTP 接口：
+
+```bash
+python -m KBzhy.app.core.reindex_service --kb-id <knowledge-base-id>
+```
+
+服务会为知识库创建临时 collection，并对所有 ready 文档重建索引。只有全部文档成功，才会在 MySQL 事务中切换知识库的 active collection 指针；任一文档失败都会保留旧 collection 继续服务。验证新索引后，可由运维代码显式调用 `ReindexService.cleanup_collection(kb_id, collection_name)` 清理旧 collection；该方法会拒绝删除当前 active collection。
+
+### 故障恢复边界
+
+- 解析、分块或索引明确失败时，会清理本次 staging 向量和安全目录，旧 active 版本不受影响。
+- 进程重启后，恢复器先原子确认任务仍可恢复，再清理本次未完成向量并重新排队，避免误删已激活版本。
+- 如果提交结果因数据库连接异常而无法确认，系统不会删除向量或文件，也不会强行写失败状态，留待后续权威查询与恢复。
+- MySQL 与 ChromaDB 仍是双写边界，不是分布式事务；上线时应为失败任务、staging 数量和临时 collection 建立监控。
+
+### 上传与索引排障
+
+上传后如果页面持续显示“后台正在索引”或文档列表不可见，按以下顺序检查：
+
+1. 确认 API 与索引 Worker 连接的是同一个 MySQL 实例和数据库。
+2. 确认两个进程使用相同的 `KBZHY_STORAGE_ROOT`；使用 worktree 时不要依赖各自项目目录下的默认存储。
+3. 查看文档任务状态是否依次经过 `queued → parsing → chunking → indexing → ready`，失败状态会保留错误信息。
+4. 如果日志出现 `batch size is invalid, it should not be larger than 10`，确认运行的是包含 Embedding 自动分批支持的当前版本。
+
+元数据运行查询使用线程隔离的 MySQL 连接并自动提交，索引 Worker 可以看到 API 刚提交的文档和任务；显式事务操作仍使用独立的非自动提交连接，以保持文档、版本和任务的原子更新边界。
 
 ## 前端说明
 
@@ -355,8 +434,9 @@ pytest
 - 文档 API
 - 流式聊天协议
 - RAG Engine 行为
-- Retriever 检索逻辑
-- Splitter 分块策略
+- Retriever 并发召回、RRF 与宽候选重排
+- 结构化解析、Parent/Child 分块与上下文组装
+- 文档版本、索引任务、恢复竞态与安全重索引
 - 前端静态构建约束
 - 性能阶段日志工具
 
@@ -410,7 +490,7 @@ uvicorn KBzhy.main:app --host 0.0.0.0 --port 8000
 | 存储 | 数据内容 | 是否必需 | 持久化说明 |
 | --- | --- | --- | --- |
 | ChromaDB | 文档分块、向量及分块元数据 | 是 | 默认写入项目根目录下的 `chroma_db/` |
-| MySQL | 知识库、文档、索引任务元数据及完整对话记录 | 是 | 使用 `knowledge_bases`、`documents`、`document_index_tasks`、`conversation_logs` 表；知识库和文档接口在连接不可用时返回 `503` |
+| MySQL | 知识库、文档、文档版本、Parent/Child 分块、索引任务及完整对话记录 | 是 | 核心表包括 `knowledge_bases`、`documents`、`document_versions`、`document_chunks`、`document_index_tasks`、`conversation_logs`；知识库和文档接口在数据库异常时返回稳定的 `500` 文案，并在服务端记录原始错误 |
 | Redis | 最近 N 轮会话上下文及会话元数据 | 否 | 热缓存数据按 TTL 过期；不可用时会话数据回退到本地文件 |
 | 本地文件 | Redis 或 MySQL 不可用时的会话上下文与对话日志 | 回退存储 | 默认写入 `data/conversations/` |
 

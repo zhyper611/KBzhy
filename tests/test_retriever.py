@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
-from KBzhy.app.core.retriever import Retriever
+import pytest
+
+from KBzhy.config import KEYWORD_RERANK_THRESHOLD
+from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate, RerankResult
+from KBzhy.app.core.retriever import Retriever, _BailianEmbeddings, rrf_fuse
 from KBzhy.app.core.splitter import Chunk
 
 
@@ -17,8 +22,9 @@ class FakeVectorStore:
             {"source": "third.md", "page": 1},
         ]
 
-    def add_documents(self, docs):
+    def add_documents(self, docs, ids=None):
         self.added_documents.extend(docs)
+        self.added_ids = list(ids or [])
 
     def get(self, where=None):
         if where == {"source": "policy.md"}:
@@ -36,6 +42,262 @@ def make_retriever(fake_vs):
     retriever._lock = threading.Lock()
     retriever._get_vectorstore = lambda kb_id: fake_vs
     return retriever
+
+
+def make_knowledge_chunk(chunk_id, *, chunk_type="child", version=2, position=0):
+    return KnowledgeChunk(
+        chunk_id=chunk_id,
+        document_id="doc-1",
+        document_version=version,
+        parent_chunk_id="parent-1" if chunk_type == "child" else None,
+        chunk_type=chunk_type,
+        content=f"content-{chunk_id}",
+        retrieval_text=f"Section\n\ncontent-{chunk_id}",
+        content_hash=f"hash-{chunk_id}",
+        section_path=("Section",),
+        page_start=1,
+        page_end=2,
+        position=position,
+        token_count=3,
+        index_version=1,
+        metadata={"source": "policy.md"},
+    )
+
+
+def make_candidate(chunk_id, raw_score=0.0, rrf_score=0.0):
+    return RetrievalCandidate(
+        chunk_id=chunk_id,
+        content=f"content-{chunk_id}",
+        metadata={"chunk_id": chunk_id},
+        vector_score=raw_score,
+        bm25_score=raw_score,
+        rrf_score=rrf_score,
+    )
+
+
+def test_bailian_document_embeddings_are_batched_by_provider_limit():
+    class EmbeddingEndpoint:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, *, model, input):
+            self.calls.append(list(input))
+            return type(
+                "EmbeddingResponse",
+                (),
+                {"data": [type("Embedding", (), {"embedding": [text]}) for text in input]},
+            )()
+
+    endpoint = EmbeddingEndpoint()
+    embeddings = _BailianEmbeddings.__new__(_BailianEmbeddings)
+    embeddings.model = "text-embedding-v4"
+    embeddings._client = type("Client", (), {"embeddings": endpoint})()
+    texts = [f"chunk-{index}" for index in range(12)]
+
+    result = embeddings.embed_documents(texts)
+
+    assert [len(batch) for batch in endpoint.calls] == [10, 2]
+    assert result == [[text] for text in texts]
+
+
+def test_rrf_merges_same_chunk_by_stable_id():
+    fused = rrf_fuse(
+        [make_candidate("a"), make_candidate("b")],
+        [make_candidate("b"), make_candidate("c")],
+        k=60,
+    )
+
+    assert fused[0].chunk_id == "b"
+    assert fused[0].vector_rank == 2
+    assert fused[0].bm25_rank == 1
+
+
+def test_rrf_uses_rank_instead_of_raw_score_scale():
+    fused = rrf_fuse(
+        [make_candidate("low", 0.01), make_candidate("high", 9999)], [], k=60
+    )
+
+    assert [item.chunk_id for item in fused] == ["low", "high"]
+
+
+def test_hybrid_search_fetches_each_route_independently_and_filters_before_rrf():
+    retriever = Retriever.__new__(Retriever)
+    retriever.vector_fetch_k = 30
+    retriever.bm25_fetch_k = 25
+    retriever.rrf_k = 60
+    retriever.rrf_candidate_k = 40
+    calls = []
+    retriever._vector_search = lambda query, kb_id, k: calls.append(("vector", k)) or [
+        ("old", {"chunk_id": "old", "doc_id": "doc-1", "document_version": 1}, 0.99)
+    ]
+    retriever._bm25_search = lambda query, kb_id, k: calls.append(("bm25", k)) or [
+        ("new", {"chunk_id": "new", "doc_id": "doc-1", "document_version": 2}, 0.01)
+    ]
+    retriever._active_version_resolver = lambda doc_ids: {"doc-1": 2}
+
+    result = retriever._hybrid_search("query", "kb1", 5)
+
+    assert sorted(calls) == [("bm25", 25), ("vector", 30)]
+    assert [item.chunk_id for item in result] == ["new"]
+    assert result[0].bm25_rank == 1
+
+
+def test_hybrid_search_uses_surviving_route_when_other_route_raises():
+    retriever = Retriever.__new__(Retriever)
+    retriever.vector_fetch_k = 30
+    retriever.bm25_fetch_k = 30
+    retriever.rrf_k = 60
+    retriever.rrf_candidate_k = 40
+    retriever._vector_search = lambda *_args: (_ for _ in ()).throw(RuntimeError("down"))
+    retriever._bm25_search = lambda *_args: [
+        ("text", {"chunk_id": "child-1"}, 0.5)
+    ]
+    retriever._active_version_resolver = lambda doc_ids: {}
+
+    result = retriever._hybrid_search("query", "kb1", 5)
+
+    assert [item.chunk_id for item in result] == ["child-1"]
+
+
+def test_stage_document_children_uses_stable_ids_and_only_indexes_children():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    children = [make_knowledge_chunk("child-1"), make_knowledge_chunk("child-2", position=1)]
+
+    retriever.stage_document_children("kb1", "doc-1", children)
+
+    assert fake_vs.added_ids == ["child-1", "child-2"]
+    assert [doc.page_content for doc in fake_vs.added_documents] == [
+        "Section\n\ncontent-child-1",
+        "Section\n\ncontent-child-2",
+    ]
+    assert fake_vs.added_documents[0].metadata["document_version"] == 2
+    assert fake_vs.added_documents[0].metadata["section_path"] == '["Section"]'
+
+
+def test_stage_document_children_is_idempotent_in_bm25():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    child = make_knowledge_chunk("child-1")
+
+    retriever.stage_document_children("kb1", "doc-1", [child])
+    retriever.stage_document_children("kb1", "doc-1", [child])
+
+    _, entries = retriever._bm25_indices["kb1"]
+    assert [entry["metadata"]["chunk_id"] for entry in entries] == ["child-1"]
+
+
+def test_remove_children_deletes_only_explicit_ids_from_both_indices():
+    fake_vs = FakeVectorStore()
+    retriever = make_retriever(fake_vs)
+    retriever.stage_document_children(
+        "kb1",
+        "doc-1",
+        [make_knowledge_chunk("child-1"), make_knowledge_chunk("child-2", position=1)],
+    )
+
+    retriever.remove_children("kb1", ["child-1"])
+
+    assert fake_vs.deleted_ids == ["child-1"]
+    _, entries = retriever._bm25_indices["kb1"]
+    assert [entry["metadata"]["chunk_id"] for entry in entries] == ["child-2"]
+
+
+def test_active_collection_switch_replaces_vectorstore_and_invalidates_bm25():
+    retriever = Retriever.__new__(Retriever)
+    active = {"name": "kbzhy_kb1"}
+    stores = {}
+    retriever._active_collection_resolver = lambda kb_id: active["name"]
+    retriever._vectorstores = {}
+    retriever._vectorstore_names = {}
+    retriever._bm25_indices = {"kb1": (object(), [{"content": "old"}])}
+    retriever._get_named_vectorstore = lambda name: stores.setdefault(name, object())
+
+    old_store = retriever._get_vectorstore("kb1")
+    active["name"] = "kbzhy_kb1_v2_20260814"
+    new_store = retriever._get_vectorstore("kb1")
+
+    assert old_store is stores["kbzhy_kb1"]
+    assert new_store is stores["kbzhy_kb1_v2_20260814"]
+    assert new_store is not old_store
+    assert "kb1" not in retriever._bm25_indices
+
+
+def test_active_collection_lookup_failure_keeps_last_known_collection():
+    retriever = Retriever.__new__(Retriever)
+    retriever._vectorstore_names = {"kb1": "kbzhy_kb1_v2_stable"}
+
+    def fail(_kb_id):
+        raise RuntimeError("database unavailable")
+
+    retriever._active_collection_resolver = fail
+
+    assert retriever._collection_name("kb1") == "kbzhy_kb1_v2_stable"
+
+
+def test_active_collection_lookup_failure_without_cache_fails_closed():
+    retriever = Retriever.__new__(Retriever)
+    retriever._vectorstore_names = {}
+    retriever._active_collection_resolver = lambda _kb_id: (_ for _ in ()).throw(
+        RuntimeError("database unavailable")
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        retriever._collection_name("kb1")
+
+
+def test_stage_collection_children_targets_explicit_collection_without_bm25_mutation():
+    retriever = Retriever.__new__(Retriever)
+    fake_vs = FakeVectorStore()
+    retriever._bm25_indices = {"kb1": (None, [{"content": "active"}])}
+    requested = []
+
+    def get_named(name):
+        requested.append(name)
+        return fake_vs
+
+    retriever._get_named_vectorstore = get_named
+
+    retriever.stage_collection_children(
+        "kbzhy_kb1_v2_temp", "kb1", "doc-1", [make_knowledge_chunk("child-1")]
+    )
+
+    assert requested == ["kbzhy_kb1_v2_temp"]
+    assert fake_vs.added_ids == ["child-1"]
+    assert retriever._bm25_indices["kb1"][1] == [{"content": "active"}]
+
+
+def test_versioned_candidates_must_match_mysql_active_version():
+    retriever = Retriever.__new__(Retriever)
+    retriever._active_version_resolver = lambda doc_ids: {"doc-1": 2}
+    candidates = [
+        ("old", {"doc_id": "doc-1", "document_version": 1}, 0.9),
+        ("new", {"doc_id": "doc-1", "document_version": 2}, 0.8),
+        ("legacy-same-doc", {"doc_id": "doc-1"}, 0.75),
+        ("legacy", {"source": "legacy.md"}, 0.7),
+    ]
+
+    filtered = retriever._filter_active_candidates(candidates)
+
+    assert [item[0] for item in filtered] == ["new", "legacy"]
+
+
+def test_active_version_lookup_failure_drops_candidates_with_document_identity():
+    retriever = Retriever.__new__(Retriever)
+
+    def fail(_doc_ids):
+        raise RuntimeError("database unavailable")
+
+    retriever._active_version_resolver = fail
+    candidates = [
+        ("versioned", {"doc_id": "doc-1", "document_version": 2}, 0.9),
+        ("legacy-same-doc", {"doc_id": "doc-1"}, 0.8),
+        ("unregistered-legacy", {"source": "legacy.md"}, 0.7),
+    ]
+
+    filtered = retriever._filter_active_candidates(candidates)
+
+    assert [item[0] for item in filtered] == ["unregistered-legacy"]
 
 
 def test_remove_document_opens_persisted_vectorstore_when_not_cached():
@@ -66,20 +328,20 @@ def test_retrieve_filters_scores_after_rerank():
     retriever = Retriever.__new__(Retriever)
     retriever.top_k = 2
     retriever.threshold = 0.35
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = 0.0
     retriever._is_complex = lambda query: False
     retriever._hybrid_search = lambda query, kb_id, top_k, request_id=None: [
         ("high after rerank", {"source": "a.md"}, 0.95),
         ("low after rerank", {"source": "b.md"}, 0.92),
     ]
-    retriever._mmr = lambda query, candidates, top_k: [
-        {"content": content, "metadata": metadata, "score": score}
-        for content, metadata, score in candidates
-    ]
-
     def fake_rerank(query, candidates, method):
-        candidates[0]["score"] = 0.8
-        candidates[1]["score"] = 0.2
-        return candidates
+        return RerankResult(
+            (replace(candidates[0], rerank_score=0.8), replace(candidates[1], rerank_score=0.2)),
+            "model",
+            True,
+        )
 
     retriever._rerank = fake_rerank
 
@@ -94,6 +356,91 @@ def test_retrieve_filters_scores_after_rerank():
     )
 
     assert [item["content"] for item in results] == ["high after rerank"]
+
+
+def test_retrieve_sends_wide_rrf_candidate_set_to_reranker():
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.0
+    retriever.keyword_rerank_threshold = 0.0
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [
+        make_candidate(f"c-{index}", rrf_score=1 - index / 100)
+        for index in range(40)
+    ]
+    received = []
+
+    def fake_rerank(query, candidates, method):
+        received.extend(candidates)
+        return RerankResult(tuple(candidates), "keyword", False)
+
+    retriever._rerank = fake_rerank
+
+    retriever.retrieve(
+        "query", "kb1", enable_expansion=False, enable_decomposition=False
+    )
+
+    assert len(received) == 30
+
+
+def test_keyword_fallback_does_not_use_request_model_threshold():
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = 0.0
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [make_candidate("a", rrf_score=0.1)]
+    retriever._rerank = lambda query, candidates, method: RerankResult(
+        (replace(candidates[0], rerank_score=0.0),), "keyword", False
+    )
+
+    result = retriever.retrieve(
+        "query", "kb1", threshold=0.99,
+        enable_expansion=False, enable_decomposition=False,
+    )
+
+    assert [item.chunk_id for item in result] == ["a"]
+
+
+def test_keyword_fallback_default_threshold_rejects_zero_signal():
+    assert KEYWORD_RERANK_THRESHOLD == 0.01
+    retriever = Retriever.__new__(Retriever)
+    retriever.top_k = 5
+    retriever.rerank_candidate_k = 30
+    retriever.model_rerank_threshold = 0.35
+    retriever.keyword_rerank_threshold = KEYWORD_RERANK_THRESHOLD
+    retriever._is_complex = lambda query: False
+    retriever._hybrid_search = lambda *args, **kwargs: [
+        make_candidate("zero", rrf_score=0.1)
+    ]
+    retriever._rerank = lambda query, candidates, method: RerankResult(
+        (replace(candidates[0], rerank_score=0.0),), "keyword", False
+    )
+
+    result = retriever.retrieve(
+        "query", "kb1", threshold=0.99,
+        enable_expansion=False, enable_decomposition=False,
+    )
+
+    assert result == []
+
+
+def test_model_failure_with_no_keyword_signal_preserves_rrf_order():
+    retriever = Retriever.__new__(Retriever)
+    retriever._rerank_model = lambda query, candidates: []
+    Retriever._model_rerank_failed_at = 0.0
+    candidates = [
+        make_candidate("first", rrf_score=0.3),
+        make_candidate("second", rrf_score=0.2),
+        make_candidate("third", rrf_score=0.1),
+    ]
+
+    result = retriever._rerank("unmatched-query", candidates, "model")
+
+    assert result.method == "keyword"
+    assert [item.chunk_id for item in result.items] == ["first", "second", "third"]
 
 
 def test_mmr_embeds_candidate_documents_in_one_batch():

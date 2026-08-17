@@ -7,6 +7,8 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Generator
 
 import httpx
@@ -20,14 +22,35 @@ from KBzhy.config import (
     READ_TIMEOUT,
     MAX_CONTEXT_TOKENS,
     CHROMA_PERSIST_DIR,
+    TOP_K,
 )
 from KBzhy.app.core.parser import DocumentParser
-from KBzhy.app.core.splitter import SmartSplitter
+from KBzhy.app.core.document_models import (
+    KnowledgeChunk,
+    ParsedDocument,
+    RetrievalCandidate,
+)
+from KBzhy.app.core.chunk_repository import ChunkRepository
+from KBzhy.app.core.context_assembler import AssembledContext, ContextAssembler, ContextUnit
+from KBzhy.app.core.metadata_store import get_metadata_store
+from KBzhy.app.core.splitter import SmartSplitter, StructuralChunker
 from KBzhy.app.core.retriever import Retriever, _http_client
 from KBzhy.app.core.memory import MemoryManager
 from KBzhy.app.core.timing import timed_stage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedDocumentIndex:
+    chunks: tuple[KnowledgeChunk, ...]
+    artifact_path: str
+
+
+@dataclass(frozen=True)
+class ParsedDocumentArtifact:
+    parsed: ParsedDocument
+    artifact_path: str
 
 KNOWLEDGE_QA_SYSTEM_PROMPT = (
     "你是一个严谨的知识库问答助手。请严格遵循以下规则：\n"
@@ -61,15 +84,23 @@ class RAGEngine:
         persist_dir: str | None = None,
         llm_model: str | None = None,
         embedding_model: str | None = None,
+        parser=None,
+        splitter=None,
+        structural_chunker=None,
+        repository=None,
+        retriever=None,
+        context_assembler=None,
     ):
         self.persist_dir = persist_dir or CHROMA_PERSIST_DIR
         self.llm_model = llm_model or LLM_MODEL
-        self.parser = DocumentParser(vlm_model=self.llm_model)
-        self.splitter = SmartSplitter()
-        self.retriever = Retriever(
-            persist_dir=self.persist_dir,
-            embedding_model=embedding_model,
+        self.parser = parser or DocumentParser(vlm_model=self.llm_model)
+        self.splitter = splitter or SmartSplitter()
+        self.structural_chunker = structural_chunker or StructuralChunker()
+        self.repository = repository or ChunkRepository(get_metadata_store())
+        self.retriever = retriever or Retriever(
+            persist_dir=self.persist_dir, embedding_model=embedding_model
         )
+        self.context_assembler = context_assembler or ContextAssembler(self.repository)
         self.memory_manager = MemoryManager()
 
     # ── LLM 调用 ────────────────────────────────
@@ -208,6 +239,102 @@ class RAGEngine:
                 doc.metadata["task_id"] = task_id
         return self._index_docs(docs, kb_id, doc_id=doc_id, task_id=task_id)
 
+    def prepare_document_index(
+        self,
+        file_path: str,
+        kb_id: str,
+        *,
+        document_id: str,
+        document_version: int,
+        index_version: int,
+        display_name: str | None = None,
+        artifact_name: str | None = None,
+    ) -> PreparedDocumentIndex:
+        parse_kwargs = {
+            "document_id": document_id,
+            "document_version": document_version,
+            "display_name": display_name,
+        }
+        if artifact_name is not None:
+            parse_kwargs["artifact_name"] = artifact_name
+        parsed_artifact = self.parse_document_for_index(file_path, kb_id, **parse_kwargs)
+        return self.chunk_document_for_index(parsed_artifact, index_version=index_version)
+
+    def parse_document_for_index(
+        self,
+        file_path: str,
+        kb_id: str,
+        *,
+        document_id: str,
+        document_version: int,
+        display_name: str | None = None,
+        artifact_name: str | None = None,
+    ) -> ParsedDocumentArtifact:
+        parsed = self.parser.parse_structured(
+            file_path,
+            document_id=document_id,
+            version=document_version,
+            kb_id=kb_id,
+        )
+        if display_name:
+            parsed = replace(
+                parsed,
+                metadata={**parsed.metadata, "source": display_name},
+            )
+        if artifact_name is None:
+            artifact_path = self.parser.save_artifact(parsed)
+        else:
+            artifact_path = self.parser.save_artifact(
+                parsed, artifact_name=artifact_name
+            )
+        return ParsedDocumentArtifact(parsed, str(artifact_path))
+
+    def chunk_document_for_index(
+        self,
+        parsed_artifact: ParsedDocumentArtifact,
+        *,
+        index_version: int,
+    ) -> PreparedDocumentIndex:
+        chunks = self.structural_chunker.split(
+            parsed_artifact.parsed, index_version=index_version
+        )
+        return PreparedDocumentIndex(tuple(chunks), parsed_artifact.artifact_path)
+
+    def stage_document_children(
+        self,
+        kb_id: str,
+        document_id: str,
+        children: list[KnowledgeChunk],
+    ) -> None:
+        self.retriever.stage_document_children(kb_id, document_id, children)
+
+    def remove_children(self, kb_id: str, chunk_ids: list[str]) -> None:
+        self.retriever.remove_children(kb_id, chunk_ids)
+
+    def stage_collection_children(
+        self,
+        collection_name: str,
+        kb_id: str,
+        document_id: str,
+        children: list[KnowledgeChunk],
+    ) -> None:
+        self.retriever.stage_collection_children(
+            collection_name, kb_id, document_id, children
+        )
+
+    def delete_collection(self, collection_name: str) -> None:
+        self.retriever.delete_collection(collection_name)
+
+    def remove_parsed_artifact(self, artifact_path: str) -> None:
+        target = Path(artifact_path).resolve()
+        root = Path(self.parser._artifact_dir).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("parsed artifact path escapes artifact directory") from exc
+        if target.is_file():
+            target.unlink()
+
     def index_bytes(self, content: bytes, filename: str, kb_id: str) -> int:
         docs = self.parser.parse_bytes(content, filename)
         return self._index_docs(docs, kb_id)
@@ -304,12 +431,22 @@ class RAGEngine:
                 memory.add_message("assistant", answer, sources=[])
             return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
 
+        assembled = self._assemble_retrieval_context(results, top_k)
+        if not assembled.units or not assembled.selected_candidates:
+            answer = KNOWLEDGE_QA_REFUSAL
+            if memory:
+                memory.add_message("user", question)
+                memory.add_message("assistant", answer, sources=[])
+            return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
+
+        context_units = list(assembled.units)
+        source_candidates = list(assembled.selected_candidates)
         if chain_type == "map_reduce":
-            answer = self._generate_map_reduce(question, results, temp)
+            answer = self._generate_map_reduce(question, context_units, temp)
         elif chain_type == "refine":
-            answer = self._generate_refine(question, results, temp)
+            answer = self._generate_refine(question, context_units, temp)
         else:
-            messages = self._build_messages(question, results, memory)
+            messages = self._build_messages(question, context_units, memory)
             with timed_stage(logger, "llm_generate_sync", request_id=request_id, model=self.llm_model):
                 answer = self._call_llm_sync(messages, temp)
 
@@ -320,13 +457,15 @@ class RAGEngine:
                 "page": r.get("metadata", {}).get("page"),
                 "score": r.get("score", 0),
             }
-            for r in results
+            for r in source_candidates
         ]
         if memory:
             memory.add_message("user", question)
             memory.add_message("assistant", answer, sources=sources)
 
-        flags = [] if self._is_refusal_answer(answer) else self._detect_hallucinations(answer, results)
+        flags = [] if self._is_refusal_answer(answer) else self._detect_hallucinations(
+            answer, source_candidates
+        )
 
         return {
             "answer": answer,
@@ -390,7 +529,20 @@ class RAGEngine:
             yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
             return
 
-        messages = self._build_messages(question, results, memory)
+        assembled = self._assemble_retrieval_context(results, top_k)
+        if not assembled.units or not assembled.selected_candidates:
+            yield '[STATUS]{"stage":"generate","message":"姝ｅ湪鐢熸垚鍥炵瓟..."}'
+            full_text = KNOWLEDGE_QA_REFUSAL
+            yield full_text
+            if memory:
+                memory.add_message("user", question)
+                memory.add_message("assistant", full_text, sources=[])
+            yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
+            return
+
+        context_units = list(assembled.units)
+        source_candidates = list(assembled.selected_candidates)
+        messages = self._build_messages(question, context_units, memory)
 
         yield '[STATUS]{"stage":"generate","message":"正在生成回答..."}'
 
@@ -416,7 +568,7 @@ class RAGEngine:
                     "page": r.get("metadata", {}).get("page"),
                     "score": r.get("score", 0),
                 }
-                for r in results
+                for r in source_candidates
             ]
             if memory:
                 memory.add_message("user", question)
@@ -566,6 +718,44 @@ class RAGEngine:
         return _WindowManager(self, messages)
 
     # ── 消息构建 ────────────────────────────────
+
+    def _assemble_retrieval_context(
+        self, results, top_k: int | None
+    ) -> AssembledContext:
+        candidates = []
+        for index, result in enumerate(results):
+            if isinstance(result, RetrievalCandidate):
+                candidates.append(result)
+                continue
+            metadata = dict(result.get("metadata") or {})
+            candidates.append(
+                RetrievalCandidate(
+                    chunk_id=str(metadata.get("chunk_id") or f"legacy-{index}"),
+                    content=result["content"],
+                    metadata=metadata,
+                    rerank_score=float(result.get("score", 0.0)),
+                )
+            )
+        final_k = top_k or TOP_K
+        assembler = getattr(self, "context_assembler", None)
+        if assembler is not None:
+            return assembler.assemble_result(candidates, final_k=final_k)
+        selected = tuple(candidates[:final_k])
+        units = tuple(
+            ContextUnit(
+                chunk_id=candidate.chunk_id,
+                document_id=str(candidate.metadata.get("doc_id") or ""),
+                content=candidate.content,
+                metadata=dict(candidate.metadata),
+                context_role="hit",
+                origin_chunk_id=candidate.chunk_id,
+                rerank_score=candidate.rerank_score,
+                parent_chunk_id=candidate.metadata.get("parent_chunk_id"),
+                position=candidate.metadata.get("position"),
+            )
+            for candidate in selected
+        )
+        return AssembledContext(selected, units)
 
     def _build_messages(
         self,

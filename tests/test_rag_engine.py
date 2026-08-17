@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import httpx
 import pytest
 from contextlib import nullcontext
+from pathlib import Path
 from fastapi import HTTPException
 
 from KBzhy.app.api import chat
+from KBzhy.app.core.context_assembler import AssembledContext, ContextUnit
+from KBzhy.app.core.document_models import RetrievalCandidate
 from KBzhy.app.core.rag_engine import KNOWLEDGE_QA_REFUSAL, KNOWLEDGE_QA_SYSTEM_PROMPT, RAGEngine
 
 
@@ -46,6 +50,126 @@ class FixedRetriever:
                 "score": 0.9,
             }
         ]
+
+
+def test_chat_generates_from_assembled_context_but_sources_remain_original_hits():
+    hit = RetrievalCandidate(
+        chunk_id="hit-1",
+        content="short child hit",
+        metadata={"doc_id": "doc-1", "source": "policy.md", "page": 2},
+        rerank_score=0.9,
+    )
+
+    class Retriever:
+        def retrieve(self, *args, **kwargs):
+            return [hit]
+
+    parent = ContextUnit(
+        chunk_id="parent-1",
+        document_id="doc-1",
+        content="expanded parent context",
+        metadata={"source": "policy.md"},
+        context_role="parent",
+        origin_chunk_id="hit-1",
+    )
+
+    class Assembler:
+        def assemble_result(self, candidates, final_k):
+            assert candidates == [hit]
+            return AssembledContext((hit,), (parent,))
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.memory_manager = FakeMemoryManager(None)
+    engine.retriever = Retriever()
+    engine.context_assembler = Assembler()
+    engine.llm_model = "test-model"
+    captured = {}
+
+    def generate(messages, temperature):
+        captured["messages"] = messages
+        return "answer"
+
+    engine._call_llm_sync = generate
+    engine._manage_context_window = lambda messages: nullcontext()
+
+    result = engine.chat(
+        question="question", kb_id="kb1", top_k=5,
+        enable_expansion=False, enable_rewrite=False,
+    )
+
+    assert "expanded parent context" in captured["messages"][0]["content"]
+    assert "short child hit" not in captured["messages"][0]["content"]
+    assert [source["content"] for source in result["sources"]] == ["short child hit"]
+
+
+def test_chat_and_stream_sources_match_selected_hits_and_respect_top_k():
+    hits = tuple(
+        RetrievalCandidate(
+            chunk_id=f"hit-{index}",
+            content=f"content-{index}",
+            metadata={"doc_id": f"doc-{index}", "source": f"doc-{index}.md"},
+            rerank_score=1.0 - index / 10,
+        )
+        for index in range(5)
+    )
+    units = (
+        ContextUnit(
+            chunk_id="parent-1", document_id="doc-1", content="parent context",
+            metadata={"source": "doc-1.md"}, context_role="parent",
+            origin_chunk_id="hit-1",
+        ),
+        ContextUnit(
+            chunk_id="hit-1", document_id="doc-1", content="content-1",
+            metadata=dict(hits[1].metadata), context_role="hit",
+            origin_chunk_id="hit-1", rerank_score=hits[1].rerank_score,
+        ),
+        ContextUnit(
+            chunk_id="hit-2", document_id="doc-2", content="content-2",
+            metadata=dict(hits[2].metadata), context_role="hit",
+            origin_chunk_id="hit-2", rerank_score=hits[2].rerank_score,
+        ),
+    )
+
+    class Retriever:
+        def retrieve(self, *args, **kwargs):
+            return list(hits)
+
+    class Assembler:
+        def assemble_result(self, candidates, final_k):
+            assert final_k == 2
+            return AssembledContext(hits[1:3], units)
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.memory_manager = FakeMemoryManager(None)
+    engine.retriever = Retriever()
+    engine.context_assembler = Assembler()
+    engine.llm_model = "test-model"
+    generated = {}
+    detected = []
+
+    def sync_generate(messages, temperature):
+        generated["sync"] = messages
+        return "answer"
+
+    engine._call_llm_sync = sync_generate
+    engine._call_llm_stream = lambda messages, temperature: iter(["stream answer"])
+    engine._manage_context_window = lambda messages: nullcontext()
+    engine._detect_hallucinations = lambda answer, sources: detected.extend(sources) or []
+
+    result = engine.chat(
+        "question", "kb1", top_k=2, enable_expansion=False, enable_rewrite=False
+    )
+    stream = list(engine.chat_stream(
+        "question", "kb1", top_k=2, enable_expansion=False, enable_rewrite=False
+    ))
+
+    assert "parent context" in generated["sync"][0]["content"]
+    assert [source["content"] for source in result["sources"]] == [
+        "content-1", "content-2"
+    ]
+    assert [item.chunk_id for item in detected] == ["hit-1", "hit-2"]
+    stream_sources = json.loads(stream[-1].removeprefix("[SOURCES]"))
+    assert [source["content"] for source in stream_sources] == ["content-1", "content-2"]
 
 
 def test_chat_records_refusal_in_session_memory():
@@ -140,6 +264,43 @@ def test_index_docs_adds_doc_and_task_metadata_to_chunks():
     assert engine.retriever.chunks[0].metadata["doc_id"] == "doc1"
     assert engine.retriever.chunks[0].metadata["task_id"] == "task1"
     assert engine.retriever.chunks[0].metadata["chunk_index"] == 1
+
+
+def test_prepare_document_index_uses_structured_parser_and_chunker(tmp_path):
+    from KBzhy.app.core.document_models import ParsedDocument
+
+    parsed = ParsedDocument(
+        document_id="doc1", version=2, title="source", language="und",
+        metadata={"kb_id": "kb1", "source": "source.md"},
+    )
+
+    class Parser:
+        def parse_structured(self, path, *, document_id, version, kb_id):
+            assert (path, document_id, version, kb_id) == ("source.md", "doc1", 2, "kb1")
+            return parsed
+
+        def save_artifact(self, value, *, artifact_name=None):
+            assert value.metadata["source"] == "display.md"
+            assert artifact_name == "reindex-task-1"
+            return tmp_path / f"{artifact_name}.json"
+
+    class Chunker:
+        def split(self, value, index_version):
+            assert value.metadata["source"] == "display.md"
+            assert index_version == 3
+            return ["parent", "child"]
+
+    engine = RAGEngine.__new__(RAGEngine)
+    engine.parser = Parser()
+    engine.structural_chunker = Chunker()
+
+    prepared = engine.prepare_document_index(
+        "source.md", "kb1", document_id="doc1", document_version=2,
+        index_version=3, display_name="display.md", artifact_name="reindex-task-1",
+    )
+
+    assert prepared.chunks == ("parent", "child")
+    assert prepared.artifact_path == str(Path(tmp_path / "reindex-task-1.json"))
 
 
 def test_prepare_query_skips_rewrite_for_clear_question_by_default():
