@@ -59,6 +59,7 @@ class DocumentParser:
         "csv": [".csv"],
         "image": [".jpg", ".jpeg", ".png", ".bmp", ".tiff"],
     }
+    _ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
     def __init__(
         self,
@@ -164,7 +165,9 @@ class DocumentParser:
             metadata=metadata,
         )
 
-    def save_artifact(self, parsed: ParsedDocument) -> Path:
+    def save_artifact(
+        self, parsed: ParsedDocument, *, artifact_name: str | None = None
+    ) -> Path:
         kb_id = parsed.metadata.get("kb_id", "default")
         self._validate_identifier(kb_id, "kb_id")
         self._validate_identifier(parsed.document_id, "document_id")
@@ -174,7 +177,10 @@ class DocumentParser:
         self._resolve_artifact_path(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_dir = self._resolve_artifact_path(target_dir)
-        target = self._resolve_artifact_path(target_dir / f"v{parsed.version}.json")
+        stem = artifact_name if artifact_name is not None else f"v{parsed.version}"
+        if not self._ARTIFACT_NAME_RE.fullmatch(stem):
+            raise ValueError("artifact name is invalid")
+        target = self._resolve_artifact_path(target_dir / f"{stem}.json")
         temp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(

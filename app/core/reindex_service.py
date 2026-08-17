@@ -65,6 +65,7 @@ class ReindexService:
                     document_version=version,
                     index_version=self.index_version,
                     display_name=snapshot["filename"],
+                    artifact_name=task_id,
                 )
                 artifact_paths.append(prepared.artifact_path)
                 chunks = list(prepared.chunks)

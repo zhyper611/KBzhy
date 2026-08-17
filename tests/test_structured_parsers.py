@@ -658,6 +658,34 @@ def test_parsed_artifact_round_trip_is_lossless(tmp_path):
     assert parser.load_artifact(path) == parsed
 
 
+def test_save_artifact_supports_safe_reindex_name_without_overwriting_active(tmp_path):
+    parser = DocumentParser(artifact_dir=tmp_path)
+    parsed = ParsedDocument(
+        document_id="doc1", version=2, title="Guide", language="zh",
+        metadata={"kb_id": "kb1"},
+    )
+
+    active = parser.save_artifact(parsed)
+    reindexed = parser.save_artifact(parsed, artifact_name="reindex-task-1")
+
+    assert active.name == "v2.json"
+    assert reindexed.name == "reindex-task-1.json"
+    assert active != reindexed
+    assert active.exists() and reindexed.exists()
+
+
+@pytest.mark.parametrize("name", ["../escape", "a/b", "", ".hidden"])
+def test_save_artifact_rejects_unsafe_artifact_name(tmp_path, name):
+    parser = DocumentParser(artifact_dir=tmp_path)
+    parsed = ParsedDocument(
+        document_id="doc1", version=1, title="Guide", language="zh",
+        metadata={"kb_id": "kb1"},
+    )
+
+    with pytest.raises(ValueError, match="artifact name"):
+        parser.save_artifact(parsed, artifact_name=name)
+
+
 def test_load_artifact_rejects_path_outside_artifact_directory(tmp_path):
     parser = DocumentParser(artifact_dir=tmp_path / "artifacts")
     outside = tmp_path / "outside.json"

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -81,12 +82,16 @@ class Engine:
         self.staged = []
         self.deleted = []
         self.removed_artifacts = []
+        self.prepare_calls = []
 
     def prepare_document_index(self, path, kb_id, **kwargs):
+        self.prepare_calls.append((path, kb_id, dict(kwargs)))
         doc_id = kwargs["document_id"]
         if doc_id == self.fail_doc:
             raise RuntimeError("parse failed")
-        return Prepared(make_chunks(doc_id), f"/artifacts/{doc_id}.json")
+        return Prepared(
+            make_chunks(doc_id), f"/artifacts/{kwargs['artifact_name']}.json"
+        )
 
     def stage_collection_children(self, collection, kb_id, doc_id, children):
         self.staged.append((collection, kb_id, doc_id, tuple(children)))
@@ -117,6 +122,11 @@ def test_reindex_switches_collection_only_after_every_document_is_staged():
     assert len(repository.staged) == 2
     assert [item[2] for item in engine.staged] == ["doc-1", "doc-2"]
     assert len(store.activated[2]) == 2
+    assert all(
+        call[2]["artifact_name"].startswith("reindex-")
+        and call[2]["artifact_name"] == store.activated[2][index]["task_id"]
+        for index, call in enumerate(engine.prepare_calls)
+    )
 
 
 def test_reindex_failure_keeps_old_collection_and_cleans_temporary_state():
@@ -128,7 +138,34 @@ def test_reindex_failure_keeps_old_collection_and_cleans_temporary_state():
     assert store.kb["active_collection_name"] == "kbzhy_kb1"
     assert len(engine.deleted) == 1
     assert len(store.aborted) == 1
-    assert engine.removed_artifacts == ["/artifacts/doc-1.json"]
+    assert len(engine.removed_artifacts) == 1
+    assert Path(engine.removed_artifacts[0]).name.startswith("reindex-")
+
+
+def test_reindex_failure_only_deletes_task_artifact_and_keeps_active(tmp_path):
+    active = tmp_path / "kb1" / "doc-1" / "v1.json"
+    active.parent.mkdir(parents=True)
+    active.write_text("active", encoding="utf-8")
+
+    class FileEngine(Engine):
+        def prepare_document_index(self, path, kb_id, **kwargs):
+            doc_id = kwargs["document_id"]
+            if doc_id == "doc-2":
+                raise RuntimeError("parse failed")
+            artifact = tmp_path / kb_id / doc_id / f"{kwargs['artifact_name']}.json"
+            artifact.write_text("reindex", encoding="utf-8")
+            return Prepared(make_chunks(doc_id), str(artifact))
+
+        def remove_parsed_artifact(self, path):
+            Path(path).unlink(missing_ok=True)
+
+    service, _, _, _ = make_service(engine=FileEngine())
+
+    with pytest.raises(RuntimeError, match="parse failed"):
+        service.reindex("kb1")
+
+    assert active.read_text(encoding="utf-8") == "active"
+    assert not list(tmp_path.rglob("reindex-*.json"))
 
 
 def test_cleanup_refuses_to_delete_active_collection():

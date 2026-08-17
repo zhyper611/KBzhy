@@ -248,14 +248,16 @@ class RAGEngine:
         document_version: int,
         index_version: int,
         display_name: str | None = None,
+        artifact_name: str | None = None,
     ) -> PreparedDocumentIndex:
-        parsed_artifact = self.parse_document_for_index(
-            file_path,
-            kb_id,
-            document_id=document_id,
-            document_version=document_version,
-            display_name=display_name,
-        )
+        parse_kwargs = {
+            "document_id": document_id,
+            "document_version": document_version,
+            "display_name": display_name,
+        }
+        if artifact_name is not None:
+            parse_kwargs["artifact_name"] = artifact_name
+        parsed_artifact = self.parse_document_for_index(file_path, kb_id, **parse_kwargs)
         return self.chunk_document_for_index(parsed_artifact, index_version=index_version)
 
     def parse_document_for_index(
@@ -266,6 +268,7 @@ class RAGEngine:
         document_id: str,
         document_version: int,
         display_name: str | None = None,
+        artifact_name: str | None = None,
     ) -> ParsedDocumentArtifact:
         parsed = self.parser.parse_structured(
             file_path,
@@ -278,7 +281,12 @@ class RAGEngine:
                 parsed,
                 metadata={**parsed.metadata, "source": display_name},
             )
-        artifact_path = self.parser.save_artifact(parsed)
+        if artifact_name is None:
+            artifact_path = self.parser.save_artifact(parsed)
+        else:
+            artifact_path = self.parser.save_artifact(
+                parsed, artifact_name=artifact_name
+            )
         return ParsedDocumentArtifact(parsed, str(artifact_path))
 
     def chunk_document_for_index(

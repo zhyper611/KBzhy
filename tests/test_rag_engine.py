@@ -208,9 +208,10 @@ def test_prepare_document_index_uses_structured_parser_and_chunker(tmp_path):
             assert (path, document_id, version, kb_id) == ("source.md", "doc1", 2, "kb1")
             return parsed
 
-        def save_artifact(self, value):
+        def save_artifact(self, value, *, artifact_name=None):
             assert value.metadata["source"] == "display.md"
-            return tmp_path / "v2.json"
+            assert artifact_name == "reindex-task-1"
+            return tmp_path / f"{artifact_name}.json"
 
     class Chunker:
         def split(self, value, index_version):
@@ -224,11 +225,11 @@ def test_prepare_document_index_uses_structured_parser_and_chunker(tmp_path):
 
     prepared = engine.prepare_document_index(
         "source.md", "kb1", document_id="doc1", document_version=2,
-        index_version=3, display_name="display.md",
+        index_version=3, display_name="display.md", artifact_name="reindex-task-1",
     )
 
     assert prepared.chunks == ("parent", "child")
-    assert prepared.artifact_path == str(Path(tmp_path / "v2.json"))
+    assert prepared.artifact_path == str(Path(tmp_path / "reindex-task-1.json"))
 
 
 def test_prepare_query_skips_rewrite_for_clear_question_by_default():
