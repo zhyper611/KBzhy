@@ -273,7 +273,7 @@ KBZHY_STORAGE_ROOT=C:/data/kbzhy
 KBZHY_ENV_FILE=C:/data/kbzhy/.env
 ```
 
-路径建议使用绝对路径。显式设置的系统环境变量优先于 `KBZHY_ENV_FILE` 和存储根目录中的 `.env`。API 进程与索引 Worker 必须使用相同的 MySQL 配置和 `KBZHY_STORAGE_ROOT`，否则可能出现任务已创建但 Worker 查不到任务，或索引完成后查询不到向量数据的情况。
+路径建议使用绝对路径。配置优先级依次为：显式系统环境变量、`KBZHY_ENV_FILE`、存储根目录中的 `.env`、项目根目录中的 `.env`；项目配置不会向父目录搜索。API 进程与索引 Worker 必须使用相同的 MySQL 配置和 `KBZHY_STORAGE_ROOT`，否则可能出现任务已创建但 Worker 查不到任务，或索引完成后查询不到向量数据的情况。
 
 ## 核心 API
 

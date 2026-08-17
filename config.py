@@ -1,22 +1,42 @@
 """KBzhy RAG 知识库问答系统 — 全局配置（阿里云百炼平台）"""
 
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv()
+
+def _absolute_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _load_environment(project_dir: str) -> None:
+    project_env_file = os.path.join(project_dir, ".env")
+    project_environment = dotenv_values(project_env_file)
+    shared_env_file = os.getenv("KBZHY_ENV_FILE") or project_environment.get(
+        "KBZHY_ENV_FILE"
+    )
+    if shared_env_file:
+        load_dotenv(_absolute_path(shared_env_file), override=False)
+
+    storage_root = (
+        os.getenv("KBZHY_STORAGE_ROOT")
+        or project_environment.get("KBZHY_STORAGE_ROOT")
+        or project_dir
+    )
+    storage_env_file = os.path.join(_absolute_path(storage_root), ".env")
+    if os.path.normcase(storage_env_file) != os.path.normcase(project_env_file):
+        load_dotenv(storage_env_file, override=False)
+    load_dotenv(project_env_file, override=False)
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_load_environment(PROJECT_DIR)
 
 
 def _configured_path(name: str, default: str) -> str:
-    return os.path.abspath(os.path.expanduser(os.getenv(name, default)))
+    return _absolute_path(os.getenv(name, default))
 
 
 STORAGE_ROOT = _configured_path("KBZHY_STORAGE_ROOT", PROJECT_DIR)
-load_dotenv(os.path.join(STORAGE_ROOT, ".env"), override=False)
 SHARED_ENV_FILE = os.getenv("KBZHY_ENV_FILE")
-if SHARED_ENV_FILE:
-    load_dotenv(_configured_path("KBZHY_ENV_FILE", SHARED_ENV_FILE), override=False)
 
 # ====== 阿里云百炼 API 配置 ======
 API_KEY = os.getenv("DASHSCOPE_API_KEY", os.getenv("OPENAI_API_KEY", "your-api-key"))

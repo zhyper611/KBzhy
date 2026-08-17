@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import importlib
+import os
 from pathlib import Path
 
 from KBzhy import config
+
+
+def test_shared_env_file_precedes_project_dotenv(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    shared_env = tmp_path / "shared.env"
+    shared_env.write_text("MYSQL_USER=shared-user\n", encoding="utf-8")
+    (project_dir / ".env").write_text(
+        f"KBZHY_ENV_FILE={shared_env.as_posix()}\nMYSQL_USER=project-user\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("KBZHY_ENV_FILE", raising=False)
+    monkeypatch.delenv("MYSQL_USER", raising=False)
+
+    config._load_environment(str(project_dir))
+
+    assert os.environ["MYSQL_USER"] == "shared-user"
 
 
 def test_storage_paths_follow_configured_root(monkeypatch, tmp_path):
