@@ -1690,9 +1690,7 @@ class RecoveryLeaseConnection:
                     )
                     self.rowcount = 1
                 elif normalized.startswith("UPDATE document_index_tasks SET status='queued'"):
-                    connection.task.update(
-                        status="queued", recovery_owner=None, recovery_lease_until=None
-                    )
+                    connection.task["status"] = "queued"
                     self.rowcount = 1
                 elif normalized.startswith("UPDATE documents SET status='queued'"):
                     connection.document["status"] = "queued"
@@ -1786,7 +1784,38 @@ def test_complete_task_recovery_requires_matching_owner():
     assert store.complete_task_recovery("task1", "worker-a") is True
     assert connection.task["status"] == "queued"
     assert connection.document["status"] == "queued"
-    assert connection.task["recovery_owner"] is None
+    assert connection.task["recovery_owner"] == "worker-a"
+    assert connection.task["recovery_lease_until"] == datetime(2026, 8, 17, 10, 5, 0)
+
+
+def test_normal_claim_accepts_matching_recovery_owner_and_clears_lease():
+    executed = []
+
+    class Cursor:
+        rowcount = 1
+
+        def close(self):
+            pass
+
+    class Connection:
+        def commit(self):
+            pass
+
+    store = object.__new__(MySQLMetadataStore)
+    store._conn = Connection()
+
+    def execute(sql, params):
+        executed.append((" ".join(sql.split()), params))
+        return Cursor()
+
+    store._execute = execute
+
+    assert store.claim_task("task1", recovery_owner="worker-a") is True
+    sql, params = executed[0]
+    assert "recovery_owner=NULL" in sql
+    assert "recovery_lease_until=NULL" in sql
+    assert "OR recovery_owner=%s" in sql
+    assert params[-1] == "worker-a"
 
 
 @pytest.mark.parametrize(

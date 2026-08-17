@@ -252,7 +252,6 @@ class InMemoryStore:
             return False
         task.update(
             status="queued", error_message=None,
-            recovery_owner=None, recovery_lease_until=None,
             updated_at=datetime.now(),
         )
         document.update(status="queued", error_message=None)
@@ -283,11 +282,21 @@ class InMemoryStore:
     def update_task(self, task_id, **changes):
         self.tasks[task_id].update(changes)
 
-    def claim_task(self, task_id):
+    def claim_task(self, task_id, recovery_owner=None):
         task = self.tasks.get(task_id)
         if not task or task.get("status") != "queued":
             return False
-        task["status"] = "parsing"
+        lease_until = task.get("recovery_lease_until")
+        if (
+            task.get("recovery_owner")
+            and lease_until
+            and lease_until > datetime.now()
+            and task.get("recovery_owner") != recovery_owner
+        ):
+            return False
+        task.update(
+            status="parsing", recovery_owner=None, recovery_lease_until=None
+        )
         return True
 
     def get_task(self, task_id):
@@ -1092,7 +1101,7 @@ def test_worker_losing_ownership_after_claim_never_changes_newer_document(tmp_pa
         "filename": "new.txt", "storage_path": str(version_path), "status": "staging",
     }
 
-    def claim_and_replace(task_id):
+    def claim_and_replace(task_id, recovery_owner=None):
         store.tasks[task_id]["status"] = "parsing"
         store.documents["doc1"].update(task_id="task2", status="queued", chunk_count=8)
         return True
@@ -1230,8 +1239,7 @@ def test_two_workers_only_lease_cleanup_and_enqueue_task_once(tmp_path):
     store.versions[("doc1", 1)] = {
         "filename": "doc.txt", "storage_path": str(path), "status": "staging",
     }
-    task_snapshot = dict(store.tasks["task1"])
-    store.list_recoverable_tasks = lambda: [dict(task_snapshot)]
+    store.list_recoverable_tasks = lambda: [dict(store.tasks["task1"])]
     remove_calls = []
 
     class Engine:

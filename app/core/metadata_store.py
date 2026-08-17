@@ -1786,7 +1786,7 @@ class MySQLMetadataStore:
                 return False
             cur.execute(
                 "UPDATE document_index_tasks SET status='queued', error_message=NULL, "
-                "recovery_owner=NULL, recovery_lease_until=NULL, updated_at=%s "
+                "updated_at=%s "
                 "WHERE task_id=%s AND recovery_owner=%s",
                 (datetime.now(), task_id, owner),
             )
@@ -1959,16 +1959,16 @@ class MySQLMetadataStore:
         cur.close()
         self._conn.commit()
 
-    def claim_task(self, task_id: str) -> bool:
+    def claim_task(self, task_id: str, recovery_owner: str | None = None) -> bool:
         cur = self._execute(
             """
             UPDATE document_index_tasks
-            SET status=%s, updated_at=%s
+            SET status=%s, recovery_owner=NULL, recovery_lease_until=NULL, updated_at=%s
             WHERE task_id=%s AND status=%s
               AND (recovery_owner IS NULL OR recovery_lease_until IS NULL
-                   OR recovery_lease_until <= NOW(3))
+                   OR recovery_lease_until <= NOW(3) OR recovery_owner=%s)
             """,
-            ("parsing", datetime.now(), task_id, "queued"),
+            ("parsing", datetime.now(), task_id, "queued", recovery_owner),
         )
         claimed = cur.rowcount == 1
         cur.close()

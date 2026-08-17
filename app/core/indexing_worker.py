@@ -149,7 +149,9 @@ class IndexingWorker:
         except RuntimeError as exc:
             self._fail_unusable_version(task, doc, str(exc))
             return
-        if hasattr(self.store, "claim_task") and not self.store.claim_task(task_id):
+        if hasattr(self.store, "claim_task") and not self.store.claim_task(
+            task_id, recovery_owner=self.recovery_owner
+        ):
             logger.info("索引任务已被其他 worker 认领或状态已变化: task=%s", task_id)
             return
 
