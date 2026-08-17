@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -30,6 +31,7 @@ _shared_redis: Any = None
 _shared_redis_checked: bool = False
 _shared_mysql: Any = None
 _shared_mysql_checked: bool = False
+_shared_mysql_lock = threading.RLock()
 
 
 def _get_shared_redis():
@@ -57,55 +59,85 @@ def _get_shared_redis():
 
 def _get_shared_mysql():
     global _shared_mysql, _shared_mysql_checked
-    if _shared_mysql_checked:
+    with _shared_mysql_lock:
+        if _shared_mysql is not None:
+            try:
+                _shared_mysql.ping(reconnect=True)
+                return _shared_mysql
+            except Exception:
+                try:
+                    _shared_mysql.close()
+                except Exception:
+                    pass
+                _shared_mysql = None
+        _shared_mysql_checked = True
+        try:
+            import pymysql
+            _shared_mysql = pymysql.connect(
+                host=MYSQL_HOST,
+                port=MYSQL_PORT,
+                user=MYSQL_USER,
+                password=MYSQL_PASSWORD,
+                database=MYSQL_DATABASE,
+                connect_timeout=3,
+                charset="utf8mb4",
+            )
+            logger.info("MySQL 连接成功: %s:%d/%s", MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE)
+        except Exception as exc:
+            logger.warning("MySQL 不可用 (%s)，冷存储回退到文件", exc)
         return _shared_mysql
-    _shared_mysql_checked = True
-    try:
-        import pymysql
-        conn = pymysql.connect(
-            host=MYSQL_HOST,
-            port=MYSQL_PORT,
-            user=MYSQL_USER,
-            password=MYSQL_PASSWORD,
-            database=MYSQL_DATABASE,
-            connect_timeout=3,
-            charset="utf8mb4",
-        )
-        logger.info("MySQL 连接成功: %s:%d/%s", MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE)
-        _shared_mysql = conn
-    except Exception as exc:
-        logger.warning("MySQL 不可用 (%s)，冷存储回退到文件", exc)
-    return _shared_mysql
+
+
+def _invalidate_shared_mysql(conn) -> None:
+    global _shared_mysql, _shared_mysql_checked
+    with _shared_mysql_lock:
+        if _shared_mysql is not conn:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _shared_mysql = None
+        _shared_mysql_checked = False
 
 
 def _ensure_table():
-    conn = _get_shared_mysql()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS conversation_logs (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                session_id VARCHAR(64) NOT NULL,
-                role VARCHAR(16) NOT NULL,
-                content TEXT NOT NULL,
-                sources TEXT DEFAULT NULL,
-                created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-                INDEX idx_session (session_id, created_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        conn.commit()
-        cur.close()
-    except Exception as exc:
-        logger.error("创建对话表失败: %s", exc)
-    try:
-        cur = conn.cursor()
-        cur.execute("ALTER TABLE conversation_logs ADD COLUMN sources TEXT DEFAULT NULL")
-        conn.commit()
-        cur.close()
-    except Exception:
-        pass
+    with _shared_mysql_lock:
+        conn = _get_shared_mysql()
+        if not conn:
+            return
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_logs (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    session_id VARCHAR(64) NOT NULL,
+                    role VARCHAR(16) NOT NULL,
+                    content TEXT NOT NULL,
+                    sources TEXT DEFAULT NULL,
+                    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+                    INDEX idx_session (session_id, created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            conn.commit()
+        except Exception as exc:
+            _invalidate_shared_mysql(conn)
+            logger.error("创建对话表失败: %s", exc)
+            return
+        finally:
+            if cur is not None:
+                cur.close()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute("ALTER TABLE conversation_logs ADD COLUMN sources TEXT DEFAULT NULL")
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            if cur is not None:
+                cur.close()
 
 
 class ConversationMemory:
@@ -114,7 +146,6 @@ class ConversationMemory:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._redis = _get_shared_redis()
-        self._mysql_conn = _get_shared_mysql()
         _ensure_table()
 
     # ── 热层：读写当前对话窗口 ──────────────────
@@ -172,44 +203,55 @@ class ConversationMemory:
 
     def _save_cold(self, role: str, content: str, sources: list[dict] | None = None):
         sources_json = json.dumps(sources, ensure_ascii=False) if sources else None
-        if self._mysql_conn:
-            try:
-                cur = self._mysql_conn.cursor()
-                cur.execute(
-                    "INSERT INTO conversation_logs (session_id, role, content, sources) VALUES (%s, %s, %s, %s)",
-                    (self.session_id, role, content, sources_json),
-                )
-                self._mysql_conn.commit()
-                cur.close()
-            except Exception as exc:
-                logger.warning("MySQL 写入失败: %s", exc)
-                self._file_append_log(role, content, sources)
-        else:
-            self._file_append_log(role, content, sources)
+        with _shared_mysql_lock:
+            conn = _get_shared_mysql()
+            if conn:
+                cur = None
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "INSERT INTO conversation_logs (session_id, role, content, sources) VALUES (%s, %s, %s, %s)",
+                        (self.session_id, role, content, sources_json),
+                    )
+                    conn.commit()
+                    return
+                except Exception as exc:
+                    _invalidate_shared_mysql(conn)
+                    logger.warning("MySQL 写入失败: %s", exc)
+                finally:
+                    if cur is not None:
+                        cur.close()
+        self._file_append_log(role, content, sources)
 
     def get_history(self, limit: int = 100) -> list[dict[str, Any]]:
         """从冷层获取历史对话（审计用）"""
-        if self._mysql_conn:
-            try:
-                cur = self._mysql_conn.cursor()
-                cur.execute(
-                    "SELECT role, content, sources, created_at FROM conversation_logs WHERE session_id=%s ORDER BY created_at DESC LIMIT %s",
-                    (self.session_id, limit),
-                )
-                rows = cur.fetchall()
-                cur.close()
-                result: list[dict[str, Any]] = []
-                for r in reversed(rows):
-                    entry: dict[str, Any] = {"role": r[0], "content": r[1], "created_at": str(r[3])}
-                    if r[2]:
-                        try:
-                            entry["sources"] = json.loads(r[2])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    result.append(entry)
-                return result
-            except Exception as exc:
-                logger.warning("MySQL 查询失败: %s", exc)
+        with _shared_mysql_lock:
+            conn = _get_shared_mysql()
+            if conn:
+                cur = None
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT role, content, sources, created_at FROM conversation_logs WHERE session_id=%s ORDER BY created_at DESC LIMIT %s",
+                        (self.session_id, limit),
+                    )
+                    rows = cur.fetchall()
+                    result: list[dict[str, Any]] = []
+                    for r in reversed(rows):
+                        entry: dict[str, Any] = {"role": r[0], "content": r[1], "created_at": str(r[3])}
+                        if r[2]:
+                            try:
+                                entry["sources"] = json.loads(r[2])
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                        result.append(entry)
+                    return result
+                except Exception as exc:
+                    _invalidate_shared_mysql(conn)
+                    logger.warning("MySQL 查询失败: %s", exc)
+                finally:
+                    if cur is not None:
+                        cur.close()
         return self._file_read_log(limit)
 
     def delete_session(self):
@@ -219,14 +261,20 @@ class ConversationMemory:
                 self._redis.delete(self._hot_key())
             except Exception:
                 pass
-        if self._mysql_conn:
-            try:
-                cur = self._mysql_conn.cursor()
-                cur.execute("DELETE FROM conversation_logs WHERE session_id=%s", (self.session_id,))
-                self._mysql_conn.commit()
-                cur.close()
-            except Exception:
-                pass
+        with _shared_mysql_lock:
+            conn = _get_shared_mysql()
+            if conn:
+                cur = None
+                try:
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM conversation_logs WHERE session_id=%s", (self.session_id,))
+                    conn.commit()
+                except Exception as exc:
+                    _invalidate_shared_mysql(conn)
+                    logger.warning("MySQL 删除会话失败: %s", exc)
+                finally:
+                    if cur is not None:
+                        cur.close()
         self._file_delete()
 
     # ── 文件存储回退 ────────────────────────────

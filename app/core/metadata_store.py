@@ -4,6 +4,7 @@ import logging
 import hashlib
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from typing import Any
@@ -115,24 +116,44 @@ class MySQLMetadataStore:
                 "cursorclass": DictCursor,
                 "connect_timeout": 5,
             }
-            self._conn = self._connect()
+            self._connection_state = threading.local()
+            self._conn = self._connect(autocommit=False)
             self._ensure_schema()
             self._migrate_legacy_json_if_present()
+            self._conn.close()
+            self._conn = self._connect(autocommit=True)
         except Exception as exc:
             raise MetadataStoreUnavailable(f"MySQL metadata store unavailable: {exc}") from exc
 
-    def _connect(self):
-        return self._pymysql.connect(**self._connect_kwargs)
+    @property
+    def _conn(self):
+        if not hasattr(self, "_connection_state"):
+            self._connection_state = threading.local()
+        connection = getattr(self._connection_state, "connection", None)
+        if connection is None:
+            connection = self._connect(autocommit=True)
+            self._connection_state.connection = connection
+        return connection
+
+    @_conn.setter
+    def _conn(self, connection):
+        if not hasattr(self, "_connection_state"):
+            self._connection_state = threading.local()
+        self._connection_state.connection = connection
+
+    def _connect(self, *, autocommit: bool = False):
+        connect_kwargs = {**self._connect_kwargs, "autocommit": autocommit}
+        return self._pymysql.connect(**connect_kwargs)
 
     def create_connection(self):
-        return self._connect()
+        return self._connect(autocommit=False)
 
     def _reconnect(self):
         try:
             self._conn.close()
         except Exception:
             pass
-        self._conn = self._connect()
+        self._conn = self._connect(autocommit=True)
 
     def _rollback_quietly(self):
         try:

@@ -117,8 +117,12 @@ class _BailianEmbeddings(Embeddings):
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        result = self._client.embeddings.create(model=self.model, input=texts)
-        return [d.embedding for d in result.data]
+        embeddings: list[list[float]] = []
+        for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
+            batch = texts[start:start + _EMBEDDING_BATCH_SIZE]
+            result = self._client.embeddings.create(model=self.model, input=batch)
+            embeddings.extend(item.embedding for item in result.data)
+        return embeddings
 
     def embed_query(self, text: str) -> list[float]:
         result = self._client.embeddings.create(model=self.model, input=text)

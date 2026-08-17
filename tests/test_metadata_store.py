@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -9,6 +10,113 @@ import pytest
 
 from KBzhy.app.core import metadata_store
 from KBzhy.app.core.metadata_store import MySQLMetadataStore
+
+
+class SnapshotDatabase:
+    def __init__(self):
+        self.tasks = {}
+
+    def commit_task(self, task_id):
+        self.tasks[task_id] = {
+            "task_id": task_id,
+            "doc_id": "doc1",
+            "kb_id": "kb1",
+            "status": "queued",
+            "error_message": None,
+            "document_version": 1,
+            "index_version": 1,
+            "recovery_owner": None,
+            "recovery_lease_until": None,
+            "created_at": datetime(2026, 8, 17, 15, 0),
+            "updated_at": datetime(2026, 8, 17, 15, 0),
+        }
+
+
+class SnapshotCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self.row = None
+
+    def execute(self, sql, params=()):
+        if "FROM document_index_tasks WHERE task_id=%s" not in " ".join(sql.split()):
+            raise AssertionError(f"unexpected SQL: {sql}")
+        tasks = self.connection.visible_tasks()
+        self.row = deepcopy(tasks.get(params[0]))
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        pass
+
+
+class SnapshotConnection:
+    def __init__(self, database, autocommit):
+        self.database = database
+        self.autocommit_enabled = autocommit
+        self.snapshot = None
+
+    def cursor(self):
+        return SnapshotCursor(self)
+
+    def visible_tasks(self):
+        if self.autocommit_enabled:
+            return self.database.tasks
+        if self.snapshot is None:
+            self.snapshot = deepcopy(self.database.tasks)
+        return self.snapshot
+
+    def close(self):
+        pass
+
+
+class SnapshotPyMySQL:
+    def __init__(self, database):
+        self.database = database
+        self.connections = []
+
+    def connect(self, **kwargs):
+        connection = SnapshotConnection(self.database, kwargs["autocommit"])
+        self.connections.append(connection)
+        return connection
+
+
+def _snapshot_store(monkeypatch):
+    import pymysql
+
+    database = SnapshotDatabase()
+    fake_pymysql = SnapshotPyMySQL(database)
+    monkeypatch.setattr(pymysql, "connect", fake_pymysql.connect)
+    monkeypatch.setattr(MySQLMetadataStore, "_ensure_schema", lambda self: None)
+    monkeypatch.setattr(MySQLMetadataStore, "_migrate_legacy_json_if_present", lambda self: None)
+    return MySQLMetadataStore(), database, fake_pymysql
+
+
+def test_runtime_connection_sees_external_commit_in_same_thread(monkeypatch):
+    store, database, fake_pymysql = _snapshot_store(monkeypatch)
+
+    assert store.get_task("task1") is None
+    database.commit_task("task1")
+
+    assert store.get_task("task1")["status"] == "queued"
+    assert fake_pymysql.connections[-1].autocommit_enabled is True
+
+
+def test_worker_thread_uses_an_isolated_runtime_connection(monkeypatch):
+    store, database, fake_pymysql = _snapshot_store(monkeypatch)
+    assert store.get_task("task1") is None
+    database.commit_task("task1")
+    worker_results = []
+
+    thread = threading.Thread(target=lambda: worker_results.append(store.get_task("task1")))
+    thread.start()
+    thread.join()
+
+    assert worker_results[0]["status"] == "queued"
+    assert len(fake_pymysql.connections) == 3
+    assert fake_pymysql.connections[-1].autocommit_enabled is True
+    transaction_connection = store.create_connection()
+    assert transaction_connection.autocommit_enabled is False
 
 
 class FakeCursor:

@@ -7,7 +7,7 @@ import pytest
 
 from KBzhy.config import KEYWORD_RERANK_THRESHOLD
 from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate, RerankResult
-from KBzhy.app.core.retriever import Retriever, rrf_fuse
+from KBzhy.app.core.retriever import Retriever, _BailianEmbeddings, rrf_fuse
 from KBzhy.app.core.splitter import Chunk
 
 
@@ -73,6 +73,31 @@ def make_candidate(chunk_id, raw_score=0.0, rrf_score=0.0):
         bm25_score=raw_score,
         rrf_score=rrf_score,
     )
+
+
+def test_bailian_document_embeddings_are_batched_by_provider_limit():
+    class EmbeddingEndpoint:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, *, model, input):
+            self.calls.append(list(input))
+            return type(
+                "EmbeddingResponse",
+                (),
+                {"data": [type("Embedding", (), {"embedding": [text]}) for text in input]},
+            )()
+
+    endpoint = EmbeddingEndpoint()
+    embeddings = _BailianEmbeddings.__new__(_BailianEmbeddings)
+    embeddings.model = "text-embedding-v4"
+    embeddings._client = type("Client", (), {"embeddings": endpoint})()
+    texts = [f"chunk-{index}" for index in range(12)]
+
+    result = embeddings.embed_documents(texts)
+
+    assert [len(batch) for batch in endpoint.calls] == [10, 2]
+    assert result == [[text] for text in texts]
 
 
 def test_rrf_merges_same_chunk_by_stable_id():

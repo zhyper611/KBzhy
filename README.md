@@ -257,6 +257,23 @@ Vite 已配置 `/api` 代理到 `http://127.0.0.1:8000`，开发时前端无需�
 | `MYSQL_USER` | `root` | MySQL 用户 |
 | `MYSQL_PASSWORD` | 空 | MySQL 密码 |
 | `MYSQL_DATABASE` | `kbzhy` | MySQL 数据库名 |
+| `KBZHY_STORAGE_ROOT` | 项目目录 | Chroma、上传文件、解析产物和文件会话的统一持久化根目录；使用 Git worktree 时应指向稳定目录 |
+| `KBZHY_ENV_FILE` | 空 | 多个 worktree 共用的运行配置文件路径；显式系统环境变量仍优先 |
+| `KBZHY_CHROMA_PERSIST_DIR` | `<存储根>/chroma_db` | 单独覆盖 ChromaDB 目录 |
+| `KBZHY_DATA_DIR` | `<存储根>/data` | 单独覆盖数据目录，其余文件目录默认从这里派生 |
+
+### Git worktree 与共享存储
+
+默认情况下，ChromaDB、上传文件和解析产物会写入当前项目目录。使用 Git worktree 开发时，每个 worktree 都有独立目录；如果不显式配置，切换 worktree 后会表现为知识库元数据仍在 MySQL 中，但本地文件或向量索引不可见。
+
+建议让所有 worktree 指向同一个稳定的持久化目录，并可选共享同一份运行配置：
+
+```env
+KBZHY_STORAGE_ROOT=C:/data/kbzhy
+KBZHY_ENV_FILE=C:/data/kbzhy/.env
+```
+
+路径建议使用绝对路径。显式设置的系统环境变量优先于 `KBZHY_ENV_FILE` 和存储根目录中的 `.env`。API 进程与索引 Worker 必须使用相同的 MySQL 配置和 `KBZHY_STORAGE_ROOT`，否则可能出现任务已创建但 Worker 查不到任务，或索引完成后查询不到向量数据的情况。
 
 ## 核心 API
 
@@ -349,6 +366,8 @@ POST /api/chat/{session_id}/stream
 9. 生成回答：根据 `stuff`、`map_reduce` 或 `refine` 策略使用组装后的证据上下文回答。
 10. 溯源与检查：来源仍对应原始检索候选；阈值和系统提示词负责证据不足拒答，关键词覆盖率提供轻量幻觉提示。
 
+文档向量化会按每批最多 10 条文本调用默认百炼 Embedding 服务，并保持结果顺序，因此较大的文档无需手动缩小分块数量来规避服务端批量上限。
+
 ### 重复上传与版本语义
 
 - 同一知识库上传相同内容时返回 `409`，不会重复构建索引。
@@ -372,6 +391,17 @@ python -m KBzhy.app.core.reindex_service --kb-id <knowledge-base-id>
 - 进程重启后，恢复器先原子确认任务仍可恢复，再清理本次未完成向量并重新排队，避免误删已激活版本。
 - 如果提交结果因数据库连接异常而无法确认，系统不会删除向量或文件，也不会强行写失败状态，留待后续权威查询与恢复。
 - MySQL 与 ChromaDB 仍是双写边界，不是分布式事务；上线时应为失败任务、staging 数量和临时 collection 建立监控。
+
+### 上传与索引排障
+
+上传后如果页面持续显示“后台正在索引”或文档列表不可见，按以下顺序检查：
+
+1. 确认 API 与索引 Worker 连接的是同一个 MySQL 实例和数据库。
+2. 确认两个进程使用相同的 `KBZHY_STORAGE_ROOT`；使用 worktree 时不要依赖各自项目目录下的默认存储。
+3. 查看文档任务状态是否依次经过 `queued → parsing → chunking → indexing → ready`，失败状态会保留错误信息。
+4. 如果日志出现 `batch size is invalid, it should not be larger than 10`，确认运行的是包含 Embedding 自动分批支持的当前版本。
+
+元数据运行查询使用线程隔离的 MySQL 连接并自动提交，索引 Worker 可以看到 API 刚提交的文档和任务；显式事务操作仍使用独立的非自动提交连接，以保持文档、版本和任务的原子更新边界。
 
 ## 前端说明
 

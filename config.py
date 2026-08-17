@@ -5,6 +5,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _configured_path(name: str, default: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.getenv(name, default)))
+
+
+STORAGE_ROOT = _configured_path("KBZHY_STORAGE_ROOT", PROJECT_DIR)
+load_dotenv(os.path.join(STORAGE_ROOT, ".env"), override=False)
+SHARED_ENV_FILE = os.getenv("KBZHY_ENV_FILE")
+if SHARED_ENV_FILE:
+    load_dotenv(_configured_path("KBZHY_ENV_FILE", SHARED_ENV_FILE), override=False)
+
 # ====== 阿里云百炼 API 配置 ======
 API_KEY = os.getenv("DASHSCOPE_API_KEY", os.getenv("OPENAI_API_KEY", "your-api-key"))
 API_BASE = os.getenv("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -30,13 +43,21 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "kbzhy")
 
 # ====== ChromaDB 配置 ======
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+CHROMA_PERSIST_DIR = _configured_path(
+    "KBZHY_CHROMA_PERSIST_DIR", os.path.join(STORAGE_ROOT, "chroma_db")
+)
 
 # ====== 路径 ======
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-FILE_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "conversations")
-UPLOAD_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploads")
-PARSED_ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "parsed")
+DATA_DIR = _configured_path("KBZHY_DATA_DIR", os.path.join(STORAGE_ROOT, "data"))
+FILE_STORAGE_DIR = _configured_path(
+    "KBZHY_FILE_STORAGE_DIR", os.path.join(DATA_DIR, "conversations")
+)
+UPLOAD_STORAGE_DIR = _configured_path(
+    "KBZHY_UPLOAD_STORAGE_DIR", os.path.join(DATA_DIR, "uploads")
+)
+PARSED_ARTIFACT_DIR = _configured_path(
+    "KBZHY_PARSED_ARTIFACT_DIR", os.path.join(DATA_DIR, "parsed")
+)
 
 # ====== 文档切分参数 ======
 CHUNK_SIZE = 500
