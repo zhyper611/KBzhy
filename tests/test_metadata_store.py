@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -191,6 +192,8 @@ def test_ensure_schema_creates_version_and_chunk_tables_and_new_columns():
     assert "ADD COLUMN document_version INT NOT NULL DEFAULT 1" in sql
     assert "ADD COLUMN index_version INT NOT NULL DEFAULT 1" in sql
     assert "ADD COLUMN attempt_count INT NOT NULL DEFAULT 0" in sql
+    assert "ADD COLUMN recovery_owner VARCHAR(128) NULL" in sql
+    assert "ADD COLUMN recovery_lease_until DATETIME(3) NULL" in sql
     assert "ADD COLUMN filename VARCHAR(255) NULL" in sql
     assert "ADD COLUMN file_type VARCHAR(32) NULL" in sql
     assert "ADD COLUMN storage_path TEXT NULL" in sql
@@ -1638,6 +1641,151 @@ class LifecycleLockOrderConnection:
 
     def close(self):
         pass
+
+
+class RecoveryLeaseConnection:
+    def __init__(
+        self, recovery_owner=None, recovery_lease_until=None,
+        updated_at=datetime(2026, 8, 17, 10, 0, 0),
+    ):
+        self.prefetch = {"doc_id": "doc1", "kb_id": "kb1"}
+        self.task = {
+            "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1",
+            "status": "indexing", "document_version": 2,
+            "recovery_owner": recovery_owner,
+            "recovery_lease_until": recovery_lease_until,
+            "updated_at": updated_at,
+        }
+        self.document = {
+            "doc_id": "doc1", "kb_id": "kb1", "task_id": "task1",
+            "status": "indexing", "current_version": 1,
+        }
+        self.version = {"doc_id": "doc1", "version": 2, "status": "staging"}
+        self.executed = []
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            rowcount = 0
+
+            def execute(self, sql, params=()):
+                normalized = " ".join(sql.split())
+                connection.executed.append((normalized, params))
+                self.rowcount = 0
+                self.row = None
+                if normalized.startswith("SELECT doc_id, kb_id FROM document_index_tasks"):
+                    self.row = dict(connection.prefetch)
+                elif normalized.startswith("SELECT * FROM documents"):
+                    self.row = dict(connection.document)
+                elif normalized.startswith("SELECT * FROM document_index_tasks"):
+                    self.row = dict(connection.task)
+                elif normalized.startswith("SELECT version FROM document_versions"):
+                    self.row = dict(connection.version)
+                elif normalized.startswith("UPDATE document_index_tasks SET recovery_owner"):
+                    connection.task.update(
+                        recovery_owner=params[0], recovery_lease_until=params[1],
+                        updated_at=params[2],
+                    )
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE document_index_tasks SET status='queued'"):
+                    connection.task.update(
+                        status="queued", recovery_owner=None, recovery_lease_until=None
+                    )
+                    self.rowcount = 1
+                elif normalized.startswith("UPDATE documents SET status='queued'"):
+                    connection.document["status"] = "queued"
+                    self.rowcount = 1
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_recovery_lease_only_allows_one_owner_and_locks_in_order():
+    connection = RecoveryLeaseConnection()
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+    now = datetime(2026, 8, 17, 10, 0, 0)
+
+    assert store.claim_task_recovery(
+        "task1", "worker-a", now, now + timedelta(minutes=5)
+    ) is True
+    assert store.claim_task_recovery(
+        "task1", "worker-b", now, now + timedelta(minutes=5)
+    ) is False
+
+    statements = [sql for sql, _ in connection.executed]
+    document_lock = next(i for i, sql in enumerate(statements) if "FROM documents" in sql)
+    task_lock = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("SELECT * FROM document_index_tasks")
+    )
+    version_lock = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("SELECT version FROM document_versions")
+    )
+    assert document_lock < task_lock < version_lock
+
+
+def test_expired_recovery_lease_can_be_reclaimed():
+    now = datetime(2026, 8, 17, 10, 0, 0)
+    connection = RecoveryLeaseConnection(
+        recovery_owner="worker-a",
+        recovery_lease_until=now - timedelta(seconds=1),
+    )
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    assert store.claim_task_recovery(
+        "task1", "worker-b", now, now + timedelta(minutes=5)
+    ) is True
+    assert connection.task["recovery_owner"] == "worker-b"
+
+
+def test_recovery_claim_rejects_stale_listing_snapshot():
+    current = datetime(2026, 8, 17, 10, 1, 0)
+    connection = RecoveryLeaseConnection(updated_at=current)
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    assert store.claim_task_recovery(
+        "task1",
+        "worker-b",
+        current,
+        current + timedelta(minutes=5),
+        current - timedelta(minutes=1),
+    ) is False
+    assert connection.task["recovery_owner"] is None
+
+
+def test_complete_task_recovery_requires_matching_owner():
+    connection = RecoveryLeaseConnection(
+        recovery_owner="worker-a",
+        recovery_lease_until=datetime(2026, 8, 17, 10, 5, 0),
+    )
+    store = object.__new__(MySQLMetadataStore)
+    store.create_connection = lambda: connection
+
+    assert store.complete_task_recovery("task1", "worker-b") is False
+    assert connection.task["status"] == "indexing"
+    assert store.complete_task_recovery("task1", "worker-a") is True
+    assert connection.task["status"] == "queued"
+    assert connection.document["status"] == "queued"
+    assert connection.task["recovery_owner"] is None
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -206,6 +206,56 @@ class InMemoryStore:
         ):
             return False
         task.update(status="queued", error_message=None)
+        document.update(status="queued", error_message=None)
+        return True
+
+    def claim_task_recovery(
+        self, task_id, owner, now, lease_until, expected_updated_at=None
+    ):
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        document = self.documents.get(task["doc_id"])
+        version = self.versions.get((task["doc_id"], task.get("document_version")))
+        current_lease = task.get("recovery_lease_until")
+        if (
+            task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+            or not document
+            or document.get("task_id") != task_id
+            or document.get("status") == "deleting"
+            or not version
+            or version.get("status") != "staging"
+            or (
+                expected_updated_at is not None
+                and task.get("updated_at") != expected_updated_at
+            )
+            or (task.get("recovery_owner") and current_lease and current_lease > now)
+        ):
+            return False
+        task.update(
+            recovery_owner=owner, recovery_lease_until=lease_until, updated_at=now
+        )
+        return True
+
+    def complete_task_recovery(self, task_id, owner):
+        task = self.tasks.get(task_id)
+        if not task or task.get("recovery_owner") != owner:
+            return False
+        document = self.documents.get(task["doc_id"])
+        version = self.versions.get((task["doc_id"], task.get("document_version")))
+        if (
+            not document
+            or document.get("task_id") != task_id
+            or document.get("status") == "deleting"
+            or not version
+            or version.get("status") != "staging"
+        ):
+            return False
+        task.update(
+            status="queued", error_message=None,
+            recovery_owner=None, recovery_lease_until=None,
+            updated_at=datetime.now(),
+        )
         document.update(status="queued", error_message=None)
         return True
 
@@ -1107,13 +1157,13 @@ def test_recovery_does_not_remove_vectors_when_task_becomes_ready_after_listing(
     task_snapshot = dict(store.tasks["task1"])
     store.list_recoverable_tasks = lambda: [task_snapshot]
 
-    def finish_concurrently(_task_id):
+    def finish_concurrently(_task_id, _owner, _now, _lease_until, _updated_at=None):
         store.tasks["task1"]["status"] = "ready"
         store.documents["doc1"].update(status="ready", current_version=1)
         store.versions[("doc1", 1)]["status"] = "active"
         return False
 
-    store.requeue_indexing_task = finish_concurrently
+    store.claim_task_recovery = finish_concurrently
     removed = []
 
     class Engine:
@@ -1161,6 +1211,79 @@ def test_recovery_removes_interrupted_task_vectors_after_requeue_claim(tmp_path)
     assert store.tasks["task1"]["status"] == "queued"
     assert store.documents["doc1"]["status"] == "queued"
     assert worker._queue.get_nowait() == "task1"
+
+
+def test_two_workers_only_lease_cleanup_and_enqueue_task_once(tmp_path):
+    path = tmp_path / "doc.txt"
+    path.write_text("content", encoding="utf-8")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1",
+        "status": "indexing", "current_version": 0,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1",
+        "status": "indexing", "document_version": 1, "index_version": 1,
+        "updated_at": datetime(2026, 8, 17, 10, 0, 0),
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "doc.txt", "storage_path": str(path), "status": "staging",
+    }
+    task_snapshot = dict(store.tasks["task1"])
+    store.list_recoverable_tasks = lambda: [dict(task_snapshot)]
+    remove_calls = []
+
+    class Engine:
+        def remove_document(self, *args, **kwargs):
+            remove_calls.append((args, kwargs))
+
+    worker_a = IndexingWorker(
+        store=store, engine_factory=lambda: Engine(), autostart=False,
+        recovery_owner="worker-a",
+    )
+    worker_b = IndexingWorker(
+        store=store, engine_factory=lambda: Engine(), autostart=False,
+        recovery_owner="worker-b",
+    )
+
+    worker_a.recover_unfinished_tasks()
+    worker_b.recover_unfinished_tasks()
+
+    assert len(remove_calls) == 1
+    assert worker_a._queue.qsize() + worker_b._queue.qsize() == 1
+
+
+def test_recovery_cleanup_failure_keeps_lease_and_does_not_enqueue(tmp_path):
+    path = tmp_path / "doc.txt"
+    path.write_text("content", encoding="utf-8")
+    store = InMemoryStore()
+    store.documents["doc1"] = {
+        "id": "doc1", "kb_id": "kb1", "task_id": "task1",
+        "status": "indexing", "current_version": 0,
+    }
+    store.tasks["task1"] = {
+        "task_id": "task1", "doc_id": "doc1", "kb_id": "kb1",
+        "status": "indexing", "document_version": 1, "index_version": 1,
+    }
+    store.versions[("doc1", 1)] = {
+        "filename": "doc.txt", "storage_path": str(path), "status": "staging",
+    }
+    store.list_recoverable_tasks = lambda: [dict(store.tasks["task1"])]
+
+    class Engine:
+        def remove_document(self, *args, **kwargs):
+            raise RuntimeError("chroma unavailable")
+
+    worker = IndexingWorker(
+        store=store, engine_factory=lambda: Engine(), autostart=False,
+        recovery_owner="worker-a",
+    )
+
+    worker.recover_unfinished_tasks()
+
+    assert worker._queue.empty()
+    assert store.tasks["task1"]["status"] == "indexing"
+    assert store.tasks["task1"]["recovery_owner"] == "worker-a"
 
 
 def test_indexing_worker_skips_task_that_was_already_claimed(tmp_path):

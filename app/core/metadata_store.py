@@ -30,6 +30,8 @@ _COLUMN_MIGRATIONS = {
     ("document_index_tasks", "document_version"): "INT NOT NULL DEFAULT 1",
     ("document_index_tasks", "index_version"): "INT NOT NULL DEFAULT 1",
     ("document_index_tasks", "attempt_count"): "INT NOT NULL DEFAULT 0",
+    ("document_index_tasks", "recovery_owner"): "VARCHAR(128) NULL",
+    ("document_index_tasks", "recovery_lease_until"): "DATETIME(3) NULL",
     ("document_versions", "filename"): "VARCHAR(255) NULL",
     ("document_versions", "file_type"): "VARCHAR(32) NULL",
     ("document_versions", "storage_path"): "TEXT NULL",
@@ -201,6 +203,8 @@ class MySQLMetadataStore:
                 document_version INT NOT NULL DEFAULT 1,
                 index_version INT NOT NULL DEFAULT 1,
                 attempt_count INT NOT NULL DEFAULT 0,
+                recovery_owner VARCHAR(128) NULL,
+                recovery_lease_until DATETIME(3) NULL,
                 created_at DATETIME(3) NOT NULL,
                 updated_at DATETIME(3) NOT NULL,
                 INDEX idx_tasks_status (status, updated_at),
@@ -785,6 +789,8 @@ class MySQLMetadataStore:
             "error_message": row.get("error_message"),
             "document_version": int(row.get("document_version") or 1),
             "index_version": int(row.get("index_version") or 1),
+            "recovery_owner": row.get("recovery_owner"),
+            "recovery_lease_until": row.get("recovery_lease_until"),
             "created_at": cls._dt(row["created_at"]),
             "updated_at": cls._dt(row["updated_at"]),
         }
@@ -1662,6 +1668,148 @@ class MySQLMetadataStore:
                 cur.close()
             conn.close()
 
+    def claim_task_recovery(
+        self,
+        task_id: str,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        expected_updated_at: Any = None,
+    ) -> bool:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT * FROM documents WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+                or not document
+                or document.get("task_id") != task_id
+                or document.get("status") == "deleting"
+                or (
+                    expected_updated_at is not None
+                    and task.get("updated_at") != self._mysql_dt(expected_updated_at)
+                )
+                or (
+                    task.get("recovery_owner")
+                    and task.get("recovery_lease_until")
+                    and task["recovery_lease_until"] > now
+                )
+            ):
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT version FROM document_versions "
+                "WHERE doc_id=%s AND version=%s AND status='staging' FOR UPDATE",
+                (task["doc_id"], task["document_version"]),
+            )
+            if not cur.fetchone():
+                conn.commit()
+                return False
+            cur.execute(
+                "UPDATE document_index_tasks SET recovery_owner=%s, "
+                "recovery_lease_until=%s, updated_at=%s WHERE task_id=%s",
+                (owner, lease_until, now, task_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
+    def complete_task_recovery(self, task_id: str, owner: str) -> bool:
+        conn = self.create_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT doc_id, kb_id FROM document_index_tasks WHERE task_id=%s",
+                (task_id,),
+            )
+            task_owner = cur.fetchone()
+            if not task_owner:
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT * FROM documents WHERE doc_id=%s AND kb_id=%s FOR UPDATE",
+                (task_owner["doc_id"], task_owner["kb_id"]),
+            )
+            document = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM document_index_tasks WHERE task_id=%s FOR UPDATE",
+                (task_id,),
+            )
+            task = cur.fetchone()
+            if (
+                not task
+                or task.get("doc_id") != task_owner["doc_id"]
+                or task.get("kb_id") != task_owner["kb_id"]
+                or task.get("status") not in {"queued", "parsing", "chunking", "indexing"}
+                or task.get("recovery_owner") != owner
+                or not document
+                or document.get("task_id") != task_id
+                or document.get("status") == "deleting"
+            ):
+                conn.commit()
+                return False
+            cur.execute(
+                "SELECT version FROM document_versions "
+                "WHERE doc_id=%s AND version=%s AND status='staging' FOR UPDATE",
+                (task["doc_id"], task["document_version"]),
+            )
+            if not cur.fetchone():
+                conn.commit()
+                return False
+            cur.execute(
+                "UPDATE document_index_tasks SET status='queued', error_message=NULL, "
+                "recovery_owner=NULL, recovery_lease_until=NULL, updated_at=%s "
+                "WHERE task_id=%s AND recovery_owner=%s",
+                (datetime.now(), task_id, owner),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            cur.execute(
+                "UPDATE documents SET status='queued', error_message=NULL, updated_at=%s "
+                "WHERE doc_id=%s AND task_id=%s AND status<>'deleting'",
+                (datetime.now(), task["doc_id"], task_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("document ownership changed during recovery")
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+
     def set_indexing_phase(self, task_id: str, phase: str) -> bool:
         if phase not in {"parsing", "chunking", "indexing"}:
             raise ValueError("indexing phase must be parsing, chunking, or indexing")
@@ -1817,6 +1965,8 @@ class MySQLMetadataStore:
             UPDATE document_index_tasks
             SET status=%s, updated_at=%s
             WHERE task_id=%s AND status=%s
+              AND (recovery_owner IS NULL OR recovery_lease_until IS NULL
+                   OR recovery_lease_until <= NOW(3))
             """,
             ("parsing", datetime.now(), task_id, "queued"),
         )
@@ -1836,6 +1986,8 @@ class MySQLMetadataStore:
             """
             SELECT * FROM document_index_tasks
             WHERE status IN ('queued', 'parsing', 'chunking', 'indexing')
+              AND (recovery_owner IS NULL OR recovery_lease_until IS NULL
+                   OR recovery_lease_until <= NOW(3))
             ORDER BY created_at ASC
             """
         )

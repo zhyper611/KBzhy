@@ -4,6 +4,8 @@ import logging
 import queue
 import shutil
 import threading
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -22,10 +24,14 @@ class IndexingWorker:
         engine_factory: Callable | None = None,
         autostart: bool = True,
         chunk_repository=None,
+        recovery_owner: str | None = None,
+        recovery_lease_seconds: int = 300,
     ):
         self.store = store or get_metadata_store()
         self.engine_factory = engine_factory or get_rag_engine
         self.chunk_repository = chunk_repository
+        self.recovery_owner = recovery_owner or uuid.uuid4().hex
+        self.recovery_lease_seconds = recovery_lease_seconds
         if self.chunk_repository is None and hasattr(self.store, "create_connection"):
             self.chunk_repository = ChunkRepository(self.store)
         self._queue: queue.Queue[str] = queue.Queue()
@@ -67,42 +73,47 @@ class IndexingWorker:
             except RuntimeError as exc:
                 self._fail_unusable_version(task, doc, str(exc))
                 continue
-            if hasattr(self.store, "requeue_indexing_task"):
-                if not self.store.requeue_indexing_task(task_id):
-                    changed = self._mark_terminal(task, doc, "stale", "document changed during recovery")
-                    if changed:
-                        self._discard_version(task, version, "stale", doc, status_already_updated=True)
-                    continue
-            else:
-                latest = self.store.get_document(task["kb_id"], task["doc_id"])
-                if not latest or latest.get("task_id") != task_id or latest.get("status") == "deleting":
-                    changed = self._mark_terminal(task, doc, "stale", "document changed during recovery")
-                    if changed:
-                        self._discard_version(task, version, "stale", doc, status_already_updated=True)
-                    continue
-                self.store.update_document(doc["id"], status="queued", error_message=None)
-                self.store.update_task(task_id, status="queued", error_message=None)
+            now = datetime.now()
+            lease_until = now + timedelta(seconds=self.recovery_lease_seconds)
+            if not self.store.claim_task_recovery(
+                task_id,
+                self.recovery_owner,
+                now,
+                lease_until,
+                task.get("updated_at"),
+            ):
+                continue
             try:
-                engine = self.engine_factory()
-                if self.chunk_repository is not None and hasattr(engine, "remove_children"):
-                    staged_child_ids = [
-                        chunk.chunk_id
-                        for chunk in self.chunk_repository.list_by_task(task_id)
-                        if chunk.chunk_type == "child"
-                    ]
-                    engine.remove_children(doc["kb_id"], staged_child_ids)
-                    self.chunk_repository.discard_task(task_id)
-                    self._remove_prepared_artifact(
-                        engine, version.get("parsed_artifact_path")
-                    )
-                else:
-                    engine.remove_document(
-                        version["filename"], doc["kb_id"],
-                        doc_id=doc["id"], task_id=task_id,
-                    )
+                self._cleanup_recoverable_task(task, doc, version)
             except Exception as exc:
-                logger.warning("恢复任务时清理旧向量失败: task=%s error=%s", task_id, exc)
-            self.enqueue(task_id)
+                logger.warning(
+                    "恢复任务清理失败，保留租约等待接管: task=%s error=%s",
+                    task_id,
+                    exc,
+                )
+                continue
+            if self.store.complete_task_recovery(task_id, self.recovery_owner):
+                self.enqueue(task_id)
+
+    def _cleanup_recoverable_task(self, task: dict, doc: dict, version: dict):
+        task_id = task["task_id"]
+        engine = self.engine_factory()
+        if self.chunk_repository is not None and hasattr(engine, "remove_children"):
+            staged_child_ids = [
+                chunk.chunk_id
+                for chunk in self.chunk_repository.list_by_task(task_id)
+                if chunk.chunk_type == "child"
+            ]
+            engine.remove_children(doc["kb_id"], staged_child_ids)
+            self.chunk_repository.discard_task(task_id)
+            artifact_path = version.get("parsed_artifact_path")
+            if artifact_path and hasattr(engine, "remove_parsed_artifact"):
+                engine.remove_parsed_artifact(artifact_path)
+            return
+        engine.remove_document(
+            version["filename"], doc["kb_id"],
+            doc_id=doc["id"], task_id=task_id,
+        )
 
     def _run(self):
         while not self._stop.is_set():
