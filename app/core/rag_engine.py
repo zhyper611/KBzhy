@@ -31,7 +31,7 @@ from KBzhy.app.core.document_models import (
     RetrievalCandidate,
 )
 from KBzhy.app.core.chunk_repository import ChunkRepository
-from KBzhy.app.core.context_assembler import ContextAssembler
+from KBzhy.app.core.context_assembler import AssembledContext, ContextAssembler, ContextUnit
 from KBzhy.app.core.metadata_store import get_metadata_store
 from KBzhy.app.core.splitter import SmartSplitter, StructuralChunker
 from KBzhy.app.core.retriever import Retriever, _http_client
@@ -431,14 +431,16 @@ class RAGEngine:
                 memory.add_message("assistant", answer, sources=[])
             return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
 
-        context_units = self._assemble_retrieval_context(results, top_k)
-        if not context_units:
+        assembled = self._assemble_retrieval_context(results, top_k)
+        if not assembled.units or not assembled.selected_candidates:
             answer = KNOWLEDGE_QA_REFUSAL
             if memory:
                 memory.add_message("user", question)
                 memory.add_message("assistant", answer, sources=[])
             return {"answer": answer, "session_id": session_id, "sources": [], "hallucination_flags": []}
 
+        context_units = list(assembled.units)
+        source_candidates = list(assembled.selected_candidates)
         if chain_type == "map_reduce":
             answer = self._generate_map_reduce(question, context_units, temp)
         elif chain_type == "refine":
@@ -455,13 +457,15 @@ class RAGEngine:
                 "page": r.get("metadata", {}).get("page"),
                 "score": r.get("score", 0),
             }
-            for r in results
+            for r in source_candidates
         ]
         if memory:
             memory.add_message("user", question)
             memory.add_message("assistant", answer, sources=sources)
 
-        flags = [] if self._is_refusal_answer(answer) else self._detect_hallucinations(answer, results)
+        flags = [] if self._is_refusal_answer(answer) else self._detect_hallucinations(
+            answer, source_candidates
+        )
 
         return {
             "answer": answer,
@@ -525,8 +529,8 @@ class RAGEngine:
             yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
             return
 
-        context_units = self._assemble_retrieval_context(results, top_k)
-        if not context_units:
+        assembled = self._assemble_retrieval_context(results, top_k)
+        if not assembled.units or not assembled.selected_candidates:
             yield '[STATUS]{"stage":"generate","message":"姝ｅ湪鐢熸垚鍥炵瓟..."}'
             full_text = KNOWLEDGE_QA_REFUSAL
             yield full_text
@@ -536,6 +540,8 @@ class RAGEngine:
             yield "[SOURCES]" + json.dumps([], ensure_ascii=False)
             return
 
+        context_units = list(assembled.units)
+        source_candidates = list(assembled.selected_candidates)
         messages = self._build_messages(question, context_units, memory)
 
         yield '[STATUS]{"stage":"generate","message":"正在生成回答..."}'
@@ -562,7 +568,7 @@ class RAGEngine:
                     "page": r.get("metadata", {}).get("page"),
                     "score": r.get("score", 0),
                 }
-                for r in results
+                for r in source_candidates
             ]
             if memory:
                 memory.add_message("user", question)
@@ -713,10 +719,9 @@ class RAGEngine:
 
     # ── 消息构建 ────────────────────────────────
 
-    def _assemble_retrieval_context(self, results, top_k: int | None):
-        assembler = getattr(self, "context_assembler", None)
-        if assembler is None:
-            return results
+    def _assemble_retrieval_context(
+        self, results, top_k: int | None
+    ) -> AssembledContext:
         candidates = []
         for index, result in enumerate(results):
             if isinstance(result, RetrievalCandidate):
@@ -731,7 +736,26 @@ class RAGEngine:
                     rerank_score=float(result.get("score", 0.0)),
                 )
             )
-        return assembler.assemble(candidates, final_k=top_k or TOP_K)
+        final_k = top_k or TOP_K
+        assembler = getattr(self, "context_assembler", None)
+        if assembler is not None:
+            return assembler.assemble_result(candidates, final_k=final_k)
+        selected = tuple(candidates[:final_k])
+        units = tuple(
+            ContextUnit(
+                chunk_id=candidate.chunk_id,
+                document_id=str(candidate.metadata.get("doc_id") or ""),
+                content=candidate.content,
+                metadata=dict(candidate.metadata),
+                context_role="hit",
+                origin_chunk_id=candidate.chunk_id,
+                rerank_score=candidate.rerank_score,
+                parent_chunk_id=candidate.metadata.get("parent_chunk_id"),
+                position=candidate.metadata.get("position"),
+            )
+            for candidate in selected
+        )
+        return AssembledContext(selected, units)
 
     def _build_messages(
         self,

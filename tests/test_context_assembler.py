@@ -1,5 +1,5 @@
 from KBzhy.app.core.chunk_repository import ContextFamily
-from KBzhy.app.core.context_assembler import ContextAssembler
+from KBzhy.app.core.context_assembler import AssembledContext, ContextAssembler
 from KBzhy.app.core.document_models import KnowledgeChunk, RetrievalCandidate
 
 
@@ -176,3 +176,34 @@ def test_token_counter_failure_keeps_highest_ranked_hit():
     )
 
     assert [unit.chunk_id for unit in units] == ["top"]
+
+
+def test_assemble_result_returns_only_hits_that_survive_quota_and_budget():
+    candidates = [
+        candidate("a-1", doc_id="a", content="one two"),
+        candidate("a-2", doc_id="a", content="three four"),
+        candidate("b-1", doc_id="b", content="five six"),
+    ]
+
+    result = assembler(token_budget=4, per_document_limit=1).assemble_result(
+        candidates, final_k=2
+    )
+
+    assert isinstance(result, AssembledContext)
+    assert [item.chunk_id for item in result.selected_candidates] == ["a-1", "b-1"]
+    assert [unit.chunk_id for unit in result.units if unit.context_role == "hit"] == [
+        "a-1", "b-1"
+    ]
+    assert assembler().assemble([candidate("legacy")], final_k=1)[0].chunk_id == "legacy"
+
+
+def test_assemble_result_drops_candidate_that_does_not_fit_remaining_budget():
+    candidates = [
+        candidate("first", content="one two"),
+        candidate("second", doc_id="doc-2", content="three four"),
+    ]
+
+    result = assembler(token_budget=3).assemble_result(candidates, final_k=2)
+
+    assert [item.chunk_id for item in result.selected_candidates] == ["first"]
+    assert [unit.chunk_id for unit in result.units] == ["first"]

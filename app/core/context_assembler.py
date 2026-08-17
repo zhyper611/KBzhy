@@ -46,6 +46,12 @@ class ContextUnit:
             return default
 
 
+@dataclass(frozen=True)
+class AssembledContext:
+    selected_candidates: tuple[RetrievalCandidate, ...]
+    units: tuple[ContextUnit, ...]
+
+
 class ContextAssembler:
     def __init__(
         self,
@@ -72,12 +78,26 @@ class ContextAssembler:
     def assemble(
         self, candidates: list[RetrievalCandidate], final_k: int
     ) -> list[ContextUnit]:
+        return list(self.assemble_result(candidates, final_k).units)
+
+    def assemble_result(
+        self, candidates: list[RetrievalCandidate], final_k: int
+    ) -> AssembledContext:
         if final_k <= 0 or not candidates:
-            return []
+            return AssembledContext((), ())
         selected = self._apply_document_quota(candidates)[:final_k]
         hits = [self._hit_unit(candidate) for candidate in selected]
         supplements = self._expand_context(selected, {unit.chunk_id for unit in hits})
-        return self._fit_token_budget(hits + supplements)
+        units = tuple(self._fit_token_budget(hits + supplements))
+        surviving_hit_ids = {
+            unit.chunk_id for unit in units if unit.context_role == "hit"
+        }
+        surviving_candidates = tuple(
+            candidate
+            for candidate in selected
+            if candidate.chunk_id in surviving_hit_ids
+        )
+        return AssembledContext(surviving_candidates, units)
 
     def _apply_document_quota(
         self, candidates: list[RetrievalCandidate]
