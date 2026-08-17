@@ -842,6 +842,7 @@ def test_create_document_version_and_task_locks_document_and_uses_max_version():
     document_update = next(statement for statement in sql if statement.startswith("UPDATE documents"))
     assert "current_version" not in document_update
     assert "content_hash" not in document_update
+    assert "chunk_count" not in document_update
     assert connection.commits == 1
     assert connection.rollbacks == 0
     assert connection.closed is True

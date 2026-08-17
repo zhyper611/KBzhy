@@ -1115,11 +1115,11 @@ class MySQLMetadataStore:
             cur.execute(
                 """
                 UPDATE documents
-                SET status=%s, chunk_count=%s, task_id=%s, error_message=%s, updated_at=%s
+                SET status=%s, task_id=%s, error_message=%s, updated_at=%s
                 WHERE doc_id=%s AND kb_id=%s
                 """,
                 (
-                    "queued", 0, task_id, None, self._mysql_dt(now), document_id, kb_id,
+                    "queued", task_id, None, self._mysql_dt(now), document_id, kb_id,
                 ),
             )
             cur.execute(

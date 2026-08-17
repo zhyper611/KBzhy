@@ -370,7 +370,7 @@ async def update_document(kb_id: str, doc_id: str, file: UploadFile = File(...))
         filename=filename,
         kb_id=kb_id,
         status=DocStatus.QUEUED,
-        chunk_count=0,
+        chunk_count=current.get("chunk_count", 0),
         task_id=task_id,
         message="文档已重新入队，后台正在处理",
     )

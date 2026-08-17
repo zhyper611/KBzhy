@@ -107,7 +107,6 @@ class InMemoryStore:
         }
         document.update(
             status="queued",
-            chunk_count=0,
             task_id=task_id,
             error_message=None,
             updated_at=now,
@@ -489,10 +488,12 @@ def test_changed_update_preserves_active_file_and_index_and_creates_staging_vers
     assert store.documents["doc1"]["filename"] == "old.txt"
     assert store.documents["doc1"]["file_type"] == ".txt"
     assert store.documents["doc1"]["storage_path"] == str(old_path)
+    assert store.documents["doc1"]["chunk_count"] == 2
     staging = store.versions[("doc1", 2)]
     assert Path(staging["storage_path"]).read_bytes() == b"new"
     assert response.task_id in staging["storage_path"]
     assert store.tasks[response.task_id]["document_version"] == 2
+    assert response.chunk_count == 2
     assert queued == [response.task_id]
 
 
