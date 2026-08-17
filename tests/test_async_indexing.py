@@ -1377,8 +1377,65 @@ def test_legacy_json_metadata_migration_imports_kbs_and_documents(monkeypatch, t
     params = [item[1] for item in executed if item[1]]
     assert ("kb1", "Legacy KB", "old", MySQLMetadataStore._mysql_dt("2026-06-12T10:00:00")) in params
     assert any(p and p[0] == "doc1" and p[1] == "kb1" and p[2] == "guide.pdf" and p[5] == 3 for p in params)
+    document_sql, document_params = next(
+        (sql, params) for sql, params in executed
+        if "INSERT IGNORE INTO documents" in " ".join(sql.split())
+    )
+    assert "current_version" in document_sql
+    assert document_params[6:8] == (1, 1)
+    version_sql, version_params = next(
+        (sql, params) for sql, params in executed
+        if "INSERT IGNORE INTO document_versions" in " ".join(sql.split())
+    )
+    assert "'active'" in version_sql
+    assert version_params[1:3] == ("doc1", "guide.pdf")
     assert ("COMMIT", None) in executed
     assert not (data_dir / "kb_meta.json").exists()
     assert not (data_dir / "doc_registry.json").exists()
     assert (data_dir / "kb_meta.json.migrated").exists()
     assert (data_dir / "doc_registry.json.migrated").exists()
+
+
+def test_legacy_json_migration_keeps_files_when_version_insert_fails(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "kb_meta.json").write_text(
+        '{"kb1":{"name":"Legacy KB"}}', encoding="utf-8"
+    )
+    (data_dir / "doc_registry.json").write_text(
+        '{"kb1":{"doc1":{"filename":"guide.pdf","status":"ready"}}}',
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    class FailingCursor:
+        def execute(self, sql, params=None):
+            calls.append((sql, params))
+            if "INSERT IGNORE INTO document_versions" in " ".join(sql.split()):
+                raise RuntimeError("version insert failed")
+
+        def close(self):
+            pass
+
+    class FakeConn:
+        def cursor(self):
+            return FailingCursor()
+
+        def commit(self):
+            calls.append(("COMMIT", None))
+
+        def rollback(self):
+            calls.append(("ROLLBACK", None))
+
+    monkeypatch.setattr("KBzhy.app.core.metadata_store.DATA_DIR", str(data_dir))
+    store = MySQLMetadataStore.__new__(MySQLMetadataStore)
+    store._conn = FakeConn()
+
+    store._migrate_legacy_json_if_present()
+
+    assert ("ROLLBACK", None) in calls
+    assert (data_dir / "kb_meta.json").exists()
+    assert (data_dir / "doc_registry.json").exists()
+    assert not (data_dir / "kb_meta.json.migrated").exists()
+    assert not (data_dir / "doc_registry.json.migrated").exists()

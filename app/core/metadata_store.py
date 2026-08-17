@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import json
 import os
 import uuid
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 _COLUMN_MIGRATIONS = {
     ("knowledge_bases", "active_collection_name"): "VARCHAR(255) NULL",
     ("documents", "content_hash"): "VARCHAR(64) NULL",
-    ("documents", "current_version"): "INT NOT NULL DEFAULT 1",
+    ("documents", "current_version"): "INT NOT NULL DEFAULT 0",
     ("documents", "parser_version"): "VARCHAR(64) NULL",
     ("documents", "active_index_version"): "INT NOT NULL DEFAULT 1",
     ("documents", "parsed_artifact_path"): "TEXT NULL",
@@ -177,7 +178,7 @@ class MySQLMetadataStore:
                 storage_path TEXT DEFAULT NULL,
                 error_message TEXT DEFAULT NULL,
                 content_hash VARCHAR(64) NULL,
-                current_version INT NOT NULL DEFAULT 1,
+                current_version INT NOT NULL DEFAULT 0,
                 parser_version VARCHAR(64) NULL,
                 active_index_version INT NOT NULL DEFAULT 1,
                 parsed_artifact_path TEXT NULL,
@@ -269,13 +270,57 @@ class MySQLMetadataStore:
                 cur.execute(sql)
             finally:
                 cur.close()
+        current_version_added = False
         for (table, column), ddl in _COLUMN_MIGRATIONS.items():
-            self._ensure_column(table, column, ddl)
+            added = self._ensure_column(table, column, ddl)
+            if (table, column) == ("documents", "current_version"):
+                current_version_added = added
         for (table, name), columns in _QUERY_INDEXES.items():
             self._ensure_query_index(table, name, columns)
+        if current_version_added:
+            self._backfill_legacy_document_states()
         self._backfill_active_document_versions()
         self._ensure_document_chunks_shape()
         self._conn.commit()
+
+    def _backfill_legacy_document_states(self):
+        cur = self._conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE documents SET current_version=1, active_index_version=1 "
+                "WHERE status='ready' AND current_version=0"
+            )
+            cur.execute(
+                "UPDATE documents SET active_index_version=0 "
+                "WHERE current_version=0 AND status IN "
+                "('queued','parsing','chunking','indexing')"
+            )
+            cur.execute(
+                """
+                INSERT IGNORE INTO document_versions
+                    (version_id, doc_id, version, content_hash, filename, file_type,
+                     storage_path, parser_version, parsed_artifact_path, status, created_at)
+                SELECT SHA2(CONCAT('legacy-staging:', d.doc_id, ':', dit.document_version), 256),
+                       d.doc_id, dit.document_version, d.content_hash, d.filename,
+                       d.file_type, d.storage_path, d.parser_version,
+                       d.parsed_artifact_path, 'staging', COALESCE(d.created_at, NOW(3))
+                FROM documents d
+                INNER JOIN document_index_tasks dit
+                        ON dit.doc_id=d.doc_id AND dit.task_id=d.task_id
+                LEFT JOIN document_versions dv
+                       ON dv.doc_id=d.doc_id AND dv.version=dit.document_version
+                WHERE d.current_version=0
+                  AND d.status IN ('queued','parsing','chunking','indexing')
+                  AND dit.status IN ('queued','parsing','chunking','indexing')
+                  AND dv.doc_id IS NULL
+                """
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     def _backfill_active_document_versions(self):
         cur = self._conn.cursor()
@@ -605,7 +650,7 @@ class MySQLMetadataStore:
         finally:
             cur.close()
         if present:
-            return
+            return False
         cur = self._conn.cursor()
         duplicate_race = False
         try:
@@ -632,6 +677,8 @@ class MySQLMetadataStore:
                 cur.close()
             if not present:
                 raise RuntimeError(f"duplicate column race did not produce expected column: {table}.{column}")
+            return False
+        return True
 
     def _ensure_query_index(self, table: str, name: str, columns: tuple[str, ...]):
         if _QUERY_INDEXES.get((table, name)) != columns:
@@ -1838,23 +1885,49 @@ class MySQLMetadataStore:
                     filename = doc.get("filename") or doc_id
                     created_at = doc.get("created_at") or datetime.now().isoformat()
                     updated_at = doc.get("updated_at") or created_at
+                    status = doc.get("status") or "ready"
+                    current_version = 1 if status == "ready" else 0
+                    active_index_version = 1 if status == "ready" else 0
                     cur.execute(
                         """
                         INSERT IGNORE INTO documents
-                            (doc_id, kb_id, filename, file_type, status, chunk_count, task_id, storage_path, error_message, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s)
+                            (doc_id, kb_id, filename, file_type, status, chunk_count,
+                             current_version, active_index_version, task_id, storage_path,
+                             error_message, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL, NULL, %s, %s)
                         """,
                         (
                             doc_id,
                             kb_id,
                             filename,
                             os.path.splitext(filename)[1],
-                            doc.get("status") or "ready",
+                            status,
                             int(doc.get("chunk_count") or 0),
+                            current_version,
+                            active_index_version,
                             self._mysql_dt(created_at),
                             self._mysql_dt(updated_at),
                         ),
                     )
+                    if status == "ready":
+                        cur.execute(
+                            """
+                            INSERT IGNORE INTO document_versions
+                                (version_id, doc_id, version, content_hash, filename,
+                                 file_type, storage_path, parser_version,
+                                 parsed_artifact_path, status, created_at)
+                            VALUES (%s, %s, 1, NULL, %s, %s, NULL, NULL, NULL, 'active', %s)
+                            """,
+                            (
+                                hashlib.sha256(
+                                    f"legacy-json:{doc_id}:1".encode()
+                                ).hexdigest(),
+                                doc_id,
+                                filename,
+                                os.path.splitext(filename)[1],
+                                self._mysql_dt(created_at),
+                            ),
+                        )
             self._conn.commit()
             self._archive_legacy_json(kb_meta_path)
             self._archive_legacy_json(doc_registry_path)

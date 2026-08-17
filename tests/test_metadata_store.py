@@ -184,7 +184,7 @@ def test_ensure_schema_creates_version_and_chunk_tables_and_new_columns():
     assert "INDEX idx_tasks_doc_version_status (doc_id, document_version, status, task_id)" in sql
     assert "ADD COLUMN active_collection_name VARCHAR(255) NULL" in sql
     assert "ADD COLUMN content_hash VARCHAR(64) NULL" in sql
-    assert "ADD COLUMN current_version INT NOT NULL DEFAULT 1" in sql
+    assert "ADD COLUMN current_version INT NOT NULL DEFAULT 0" in sql
     assert "ADD COLUMN parser_version VARCHAR(64) NULL" in sql
     assert "ADD COLUMN active_index_version INT NOT NULL DEFAULT 1" in sql
     assert "ADD COLUMN parsed_artifact_path TEXT NULL" in sql
@@ -200,8 +200,9 @@ def test_ensure_column_does_not_alter_existing_column():
     store = object.__new__(MySQLMetadataStore)
     store._conn = SchemaConnection({("documents", "content_hash")})
 
-    store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
+    added = store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
 
+    assert added is False
     assert len(store._conn.executed) == 1
     assert "INFORMATION_SCHEMA.COLUMNS" in store._conn.executed[0][0]
 
@@ -210,8 +211,9 @@ def test_ensure_column_alters_missing_column_once():
     store = object.__new__(MySQLMetadataStore)
     store._conn = SchemaConnection()
 
-    store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
+    added = store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
 
+    assert added is True
     alter_statements = [sql for sql, _ in store._conn.executed if sql.startswith("ALTER TABLE")]
     assert alter_statements == ["ALTER TABLE documents ADD COLUMN content_hash VARCHAR(64) NULL"]
 
@@ -220,7 +222,27 @@ def test_ensure_column_ignores_duplicate_column_race():
     store = object.__new__(MySQLMetadataStore)
     store._conn = SchemaConnection(alter_error=RuntimeError(1060, "Duplicate column"))
 
-    store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
+    added = store._ensure_column("documents", "content_hash", "VARCHAR(64) NULL")
+
+    assert added is False
+
+
+def test_ensure_schema_only_classifies_legacy_states_when_current_version_is_added():
+    missing = object.__new__(MySQLMetadataStore)
+    missing._conn = SchemaConnection()
+    missing._ensure_schema()
+
+    existing = object.__new__(MySQLMetadataStore)
+    existing._conn = SchemaConnection({("documents", "current_version")})
+    existing._ensure_schema()
+
+    missing_sql = "\n".join(sql for sql, _ in missing._conn.executed)
+    existing_sql = "\n".join(sql for sql, _ in existing._conn.executed)
+    assert "UPDATE documents SET current_version=1" in missing_sql
+    assert "legacy-staging:" in missing_sql
+    assert "status IN ('queued','parsing','chunking','indexing')" in missing_sql
+    assert "UPDATE documents SET current_version=1" not in existing_sql
+    assert "legacy-staging:" not in existing_sql
 
 
 def test_ensure_column_does_not_hide_other_alter_errors():
